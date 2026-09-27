@@ -250,6 +250,21 @@ def extract_features(
     )
 
 
+
+def effective_independent_windows(
+    n_windows: int,
+    window_n: int = WINDOW_N,
+    stride: int = WINDOW_STRIDE,
+) -> int:
+    """Overlap-aware count of approximately independent windows.
+
+    With stride < window_n, consecutive windows share frames. Scale by
+    ``stride / window_n`` so reported sample sizes are not inflated by 50% overlap.
+    """
+    if n_windows <= 0:
+        return 0
+    return max(1, int(round(n_windows * float(stride) / float(window_n))))
+
 def reconstruct_window_dataframe(
     df: pd.DataFrame,
     start: int,
