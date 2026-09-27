@@ -188,12 +188,12 @@ def extract_features(
     window_n: int = WINDOW_N,
     stride: int = WINDOW_STRIDE,
     top_ids: Sequence[int] = TOP_IDS,
-    attack_majority: float = 0.1,
+    attack_majority: float = 0.02,
 ) -> WindowBatch:
     """Slide windows over ``df`` and extract features.
 
     A window is labeled attack if the fraction of frames with label=='attack'
-    is >= ``attack_majority`` (default 10% so sparse injection still flags).
+    is >= ``attack_majority`` (default 2% so sparse injection still flags).
     Family = mode of non-empty attack_family among attack frames, else "".
     """
     ts, ids, data = frames_from_df(df)
