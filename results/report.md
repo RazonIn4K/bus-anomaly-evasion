@@ -20,10 +20,11 @@
 
 ### (0) Key finding — structure over payload (scoped)
 
-> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from tracked `results/report.md` (pipeline-generated `results/aggregate.json` is not tracked):
+> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from tracked `results/report.md` and `results/aggregate.json`:
 > - **Spoof / replay:** naive mean recon ≈**0.23** ≪ τ≈**0.53**, so payload-only attacks are largely invisible here (spoof naive TPR **0.0000**; replay naive TPR **0.0167** — tiny, not absolute zero).
 > - **Frame-space PGD (injection):** reduced recon in ~**99%** of injection windows (`frac_improved` **0.99**) but produced **no observed TPR reduction** (mean recon **1.38** still > τ≈**0.53**) under free-byte + objective freeze in these runs.
-> - **Mimicry:** the only rate-shaping family that partly reduces detection — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop remained detected in the evaluated runs under the tested constraints; these results do not establish that evasion is impossible.
+> - **Mimicry:** the only method that partly reduced detection (by shaping message rates) — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop remained detected in the evaluated runs under the tested constraints; these results do not establish that evasion is impossible.
+>
 > Gate status unchanged: **GATES_PASS=False** (FPR PASS; all-seed inj FAIL).
 
 

@@ -8,12 +8,14 @@ attack-objective constraint. A detector trained only on "normal" traffic flags
 what it can't reconstruct; a shaped attack that sits on the normal manifold slips
 under the threshold.
 
-> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from tracked `results/report.md` (pipeline-generated `results/aggregate.json` is not tracked):
+> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from tracked `results/report.md` and `results/aggregate.json`:
 > - **Spoof / replay:** naive mean recon ≈**0.23** ≪ τ≈**0.53**, so payload-only attacks are largely invisible here (spoof naive TPR **0.0000**; replay naive TPR **0.0167** — tiny, not absolute zero).
 > - **Frame-space PGD (injection):** reduced recon in ~**99%** of injection windows (`frac_improved` **0.99**) but produced **no observed TPR reduction** (mean recon **1.38** still > τ≈**0.53**) under free-byte + objective freeze in these runs.
-> - **Mimicry:** the only rate-shaping family that partly reduces detection — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop remained detected in the evaluated runs under the tested constraints; these results do not establish that evasion is impossible.
+> - **Mimicry:** the only method that partly reduced detection (by shaping message rates) — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop remained detected in the evaluated runs under the tested constraints; these results do not establish that evasion is impossible.
+>
 > Gate status unchanged: **GATES_PASS=False** (FPR PASS; all-seed inj FAIL).
 
+---
 
 > **Synthetic only.** Portfolio research artifact. Not a real vehicle bus, not a
 > production IDS, no HIL claims.
@@ -51,7 +53,7 @@ Mean naive → mimicry: **1.0000 → 0.8357** (Δ **0.1643**); mean obj retentio
 
 **(c) Flood / drop remained detected under tested constraints** — naive recon ≫ τ (~618 flood / ~714 drop vs τ ~0.53). In these runs, frame-space PGD left `true_pgd` TPR at **1.0** (Δ **0**, `n_true_pgd`=40/seed) while retaining the objective. Observed outcome only — these results do not establish that evasion is impossible.
 
-**PGD** is reported per-family with `n_true_pgd`; zero / null Δ is honest (thinning ≠ PGD; no never-worse clamp). Full tables: tracked `results/report.md` (pipeline-generated `results/aggregate.json` is not tracked).
+**PGD** is reported per-family with `n_true_pgd`; zero / null Δ is honest (thinning ≠ PGD; no never-worse clamp). Full tables: tracked `results/report.md` and `results/aggregate.json`.
 
 ## Reproduce
 
