@@ -34,13 +34,21 @@ def split_normal_windows(
     seed: int = 0,
     train_frac: float = 0.7,
     val_frac: float = 0.15,
+    temporal: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split NORMAL windows into train / val / test (disjoint)."""
+    """Split NORMAL windows into train / val / test (disjoint).
+
+    Default ``temporal=True``: contiguous time order (early→train, mid→val for τ,
+    late→test FPR). Prefer temporal held-out NORMAL for τ calibration per DESIGN.
+    ``seed`` is unused when temporal but kept for API stability.
+    """
     n = len(X)
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
     n_train = int(n * train_frac)
     n_val = int(n * val_frac)
+    if temporal:
+        return X[:n_train], X[n_train : n_train + n_val], X[n_train + n_val :]
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n)
     train_idx = idx[:n_train]
     val_idx = idx[n_train : n_train + n_val]
     test_idx = idx[n_train + n_val :]
@@ -174,6 +182,11 @@ def run_training_pipeline(
         "seed": seed,
         "tau": tau,
         "percentile": 99.0,
+        "tau_calibration_split": "temporal_held_out_NORMAL_val",
+        "fpr_split_description": (
+            "same-stream temporal test split of the NORMAL generator stream "
+            "(train/val/test contiguous); τ = p99(val)"
+        ),
         "fpr_test_normal": fpr_test,
         "n_train": int(len(X_train)),
         "n_val": int(len(X_val)),
