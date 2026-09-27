@@ -13,14 +13,21 @@ under the threshold.
 
 ## Results (seeds 0–2; see `results/report.md`)
 
-| Story | Result |
-| --- | --- |
-| **(a) Injection mimicry** | Naive TPR ~70% → mimicry ~35% at fixed τ; objective retained ~84%; 0 constraint violations |
-| **(b) Blind spot** | Replay / spoof naive TPR ~2–25% — stateless window features miss in-range on-schedule attacks |
-| **(c) Flood / drop** | Not evadable under objective (recon ≫ τ); frame-space PGD does not change that |
+Primary operating point: **τ = p99 reconstruction MSE on held-out NORMAL
+calibration only** (never attack/test; never retuned on attacks).
 
-Full per-family TPR @ τ and @ matched 1% FPR, PGD `n_true_pgd` counts, and FPR±std:
-**`results/report.md`**.
+| Story | What to look for |
+| --- | --- |
+| **(a) Injection mimicry @ τ** | Gated naive→mimicry ΔTPR at fixed NORMAL-derived τ, with objective retention and 0 constraint violations. Headline only if predeclared gates pass (naive≥20%/seed, mean Δ≥10pp, Δ>0 all seeds); otherwise report actual rates honestly. |
+| **(b) Blind spot** | Replay / spoof low naive TPR — stateless window features miss in-range on-schedule attacks (detector limitation, not an evasion win). |
+| **(c) Flood / drop** | Not evadable under objective (recon ≫ τ). Frame-space PGD does not change that — say **not evadable**, not “PGD failed.” |
+
+**PGD** is reported per-family with `n_true_pgd` window counts; zero / null Δ is an
+honest outcome (thinning ≠ PGD; no never-worse clamp). Matched 1% FPR ROC point is
+**secondary/diagnostic only**.
+
+Numbers: **`results/report.md`** and **`results/aggregate.json`** (regenerate with the
+pipeline — do not trust stale copy-paste).
 
 ## Reproduce
 
@@ -36,17 +43,18 @@ pytest -q
 - `src/generate.py`  — synthetic normal + attack telemetry
 - `src/features.py`  — windowing + feature extraction
 - `src/model.py`     — tiny MLP autoencoder
-- `src/train.py`     — train on normal only; calibrate threshold (p99 val)
-- `src/evaluate.py`  — ROC-AUC, detection @ fixed FPR, matched 1% FPR τ
-- `src/attack.py`    — mimicry (black-box) + **frame-space** PGD (white-box)
+- `src/train.py`     — NORMAL-only train; τ = p99 held-out NORMAL calib
+- `src/evaluate.py`  — ROC-AUC, detection @ fixed FPR, matched 1% FPR (diagnostic)
+- `src/attack.py`    — mimicry (black-box) + **frame-space** PGD (white-box, in-loop Π_C)
 - `src/run_pipeline.py` — end-to-end seeds → `results/`
-- `tests/`           — determinism, no-leakage, threshold calibration, evasion honesty
+- `tests/`           — determinism, no-leakage, free-byte freezes, byte-stat identity
 - `DESIGN.md`        — threat model and design decisions
 - `AGENTS.md`        — agent conventions / non-negotiables
 
 ## Honesty rules
 
 - τ from held-out **NORMAL** only (never attack/test).
+- Fresh-NORMAL FPR uses a **different** seed/stream than train/calib.
 - No never-worse-than-naive clamp on recon MSE.
-- Thinning ≠ PGD (`true_pgd` is frame-space byte PGD with in-loop Π_C only).
-- Report small / null / family-local gaps plainly.
+- Thinning ≠ PGD (`true_pgd` = frame-space byte PGD with in-loop Π_C only).
+- Report small / null / family-local gaps plainly. Macro Δ hides family structure.
