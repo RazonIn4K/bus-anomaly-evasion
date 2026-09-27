@@ -10,6 +10,8 @@
 
 **Evasion = minimize reconstruction error subject to an attack-objective constraint**, under bus-feasible projections.
 
+> **Phase 2 amendment:** Primary white-box evasion is **frame-space PGD** on free payload bytes with bus-feasible \(\Pi_{\mathcal{C}}\) (re-extract features after each projected step). Earlier “feature-space PGD” wording in this doc is **historical Phase 1 intent only** and must not drive implementation or claims.
+
 ---
 
 ## 1. Threat model
@@ -36,18 +38,18 @@
 | Action | Morph attack windows so feature stats approach the NORMAL profile while preserving attack objective (e.g. injected rate ≥ target, spoofed signal moves toward target, flood intensity, drop duration, replay payload identity). |
 | Inspiration | Classical mimicry / blending against anomaly detectors ([4], [5]). |
 
-### White-box PGD (primary method)
+### White-box PGD (primary method) — frame-space
 
 | Capability | Detail |
 | --- | --- |
 | Knowledge | Full AE weights, loss (MSE reconstruction), and fixed threshold τ. |
-| Action | Iterative projected gradient descent on features: minimize reconstruction error (or push score below τ) **subject to** attack-objective constraint + feasibility set \(\mathcal{C}\). |
-| Projection \(\Pi_{\mathcal{C}}\) | Bytes ∈ {0…255}; counts ∈ ℕ₀; inter-arrival / rates physically feasible (IAT > 0, rate ≤ bus capacity proxy); after each step re-quantize and re-extract features through the **same** pipeline as inference. |
+| Action | Iterative projected gradient descent on **frame free bytes** (not on the feature vector): minimize reconstruction error of the **re-extracted** window features (or push score below τ) **subject to** attack-objective constraint + feasibility set \(\mathcal{C}\). |
+| Projection \(\Pi_{\mathcal{C}}\) | Free payload bytes ∈ {0…255}; attack-objective fields held / constrained as required; schedule / IDs / counts remain bus-feasible where the attack family allows. After each step: assemble frames → run the **same** feature extractor as inference → score. No floating feature δ that is not realizable as frames. |
 
 ### In scope
 
 - Synthetic generator: injection, spoof (incl. gradual change), flood, drop/suppress, replay.
-- Feature-space mimicry and constrained PGD.
+- Black-box mimicry (morph attack traffic / free bytes toward NORMAL feature stats) and **constrained frame-space PGD**.
 - Honest gap reporting: naive attack TPR vs evasion-optimized TPR at fixed FPR.
 
 ### Out of scope
@@ -67,7 +69,7 @@ Synthetic CAN can support **method** research (AE + threshold discipline + const
 
 - Relative behavior of reconstruction-error detectors under controlled attack families.
 - Whether constrained optimization reduces detection rate at a fixed NORMAL-derived FPR.
-- Engineering of projection / feasibility constraints in feature space.
+- Engineering of projection / feasibility constraints in **frame space** (free-byte \(\Pi_{\mathcal{C}}\)) with honest feature re-extraction.
 
 ### What it cannot claim
 
@@ -81,7 +83,7 @@ Synthetic CAN can support **method** research (AE + threshold discipline + const
 | --- | --- | --- |
 | Over-clean NORMAL | AE learns a tiny manifold; naive attacks look “hard,” evasion looks “easy” | Inject realistic jitter, multi-mode driving regimes, mild missingness; report NORMAL reconstruction distribution |
 | Circular evaluation | Attack generator shares hidden state with detector features | Generator emits discrete frames → **same** feature extractor as IDS; no gradient shortcuts past frame assembly |
-| Unconstrained PGD | Floating features not invertible to frames | Mandatory \(\Pi_{\mathcal{C}}\) + two-pass verify: optimize → frames → re-extract → score |
+| Unconstrained / feature-space-only PGD | Feature δ not realizable as bus frames (or free bytes left unconstrained) | Optimize **frames/free bytes** only; mandatory \(\Pi_{\mathcal{C}}\) + verify: frames → re-extract → score |
 | Threshold leakage | τ fitted on attack/test | τ = p99 of reconstruction error on **held-out NORMAL only**; never retuned on attacks |
 | Objective collapse | Evasion succeeds by undoing the attack (signal returns to baseline) | Report **attack-objective retention** rate alongside TPR drop |
 | Scope creep in writeups | Portfolio text implies vehicle results | Every results claim tagged “synthetic only” |
@@ -127,10 +129,12 @@ If Phase 2 shows payload stats add little vs counts+IAT alone, drop payload stat
 
 | Role | Method | Rationale |
 | --- | --- | --- |
-| **Primary demo** | **Constrained white-box PGD on features** | Directly encodes the thesis (min reconstruction error s.t. attack objective + \(\mathcal{C}\)). Shows ML skill: gradients, projection, constraint design, two-pass verification. Anchored in Madry-style PGD ([1]). |
-| **Required baseline** | **Black-box mimicry** | Shows evasion without model access; links to classical IDS literature ([4], [5]). Prevents “only white-box matters” story. |
+| **Primary demo** | **Constrained white-box PGD in frame space** (free-byte \(\Pi_{\mathcal{C}}\)) | Directly encodes the thesis on realizable bus traffic: min reconstruction error s.t. attack objective + \(\mathcal{C}\). Gradients flow AE ← features ← frames/bytes. Anchored in Madry-style PGD ([1]), adapted to discrete bytes + projection. |
+| **Required baseline** | **Black-box mimicry** | Shows evasion without model access; classical IDS line ([4], [5]). Separate threat model from PGD — do **not** gate a mimicry claim on PGD \(\Delta\)TPR. |
 
-**Both are implemented and reported.** PGD is the headline technical artifact; mimicry is the honesty / realism baseline.
+**Both are implemented and reported.** Frame-space PGD is the headline white-box artifact; mimicry is the honesty / realism baseline.
+
+**Historical note:** Phase 1 drafted “PGD on features.” Phase 2 (David) locks **frame-space** free-byte PGD instead. Do not implement feature-space morph as the white-box primary.
 
 ### Why not mimicry-only
 
@@ -140,18 +144,18 @@ Mimicry alone under-sells the optimization thesis and looks like feature enginee
 
 White-box-only results overstate attacker power for a portfolio narrative and skip the classical IDS evasion line of work.
 
-### Formulation sketch (PGD)
+### Formulation sketch (frame-space PGD)
+
+Let \(b\) be editable free payload bytes in the attack window frames, \(f(\cdot)\) the fixed feature extractor, and \(\mathrm{AE}\) the frozen autoencoder.
 
 \[
-\min_{\delta}\; \|\,x+\delta - \mathrm{AE}(x+\delta)\,\|_2^2
+\min_{b}\; \|\,f(\mathrm{frames}(b)) - \mathrm{AE}(f(\mathrm{frames}(b)))\,\|_2^2
 \quad\text{s.t.}\quad
-g_{\text{attack}}(x+\delta)\ge \tau_{\text{obj}},\quad
-x+\delta\in\mathcal{C}
+g_{\text{attack}}(\mathrm{frames}(b))\ge \tau_{\text{obj}},\quad
+b\in\Pi_{\mathcal{C}}(\cdot)
 \]
 
-Alternate practical form: minimize reconstruction score until score < τ_IDS while projecting onto \(\{x : g_{\text{attack}}(x)\ge\tau_{\text{obj}}\}\cap\mathcal{C}\).
-
----
+Practical loop: PGD step on \(b\) → \(\Pi_{\mathcal{C}}\) (bytes 0…255, objective retention) → reassemble frames → re-extract \(f\) → MSE → repeat. Score used for detection must match the train/eval feature path.
 
 ## 5. Honest headline metric + secondary metrics
 
@@ -164,6 +168,8 @@ Alternate practical form: minimize reconstruction score until score < τ_IDS whi
    - mimicry-optimized attacks
    - PGD-optimized attacks
 4. Headline number: **ΔTPR = TPR_naive − TPR_evasion** (per family and macro-average). Report even if small or negative.
+
+**Threat-model note:** Mimicry and PGD are different adversary models. Report each family’s \(\Delta\)TPR on its own; a mimicry claim does **not** require PGD \(\Delta\)TPR > 0. If τ is fit on same-stream temporal held-out NORMAL, disclose a **fresh-NORMAL FPR** check (independent seed) as the honesty guard; τ itself remains p99 on held-out NORMAL only.
 
 ### Secondary (diagnostic)
 
@@ -194,7 +200,7 @@ Only verified entries. Each checked via arXiv / ACM / IEEE / DOI.
 - **Authors:** Aleksander Madry, Aleksandar Makelov, Ludwig Schmidt, Dimitris Tsipras, Adrian Vladu  
 - **Venue:** ICLR 2018; arXiv:1706.06083  
 - **Verify:** https://arxiv.org/abs/1706.06083  
-- **Relevance:** Canonical projected gradient descent adversary; basis for our white-box feature-space PGD.
+- **Relevance:** Canonical projected gradient descent adversary; basis for our white-box **frame-space** PGD (free-byte \(\Pi_{\mathcal{C}}\), features re-extracted after each step).
 
 ### [2] Hanselmann et al., 2020 — CANet (CAN AE IDS)
 
@@ -243,7 +249,8 @@ Only verified entries. Each checked via arXiv / ACM / IEEE / DOI.
 | Train set | NORMAL windows only | Early-stop on NORMAL val reconstruction |
 | Threshold | **p99** of MSE on held-out NORMAL val | Never fit on attack/test |
 | Attacks | injection, spoof (incl. gradual), flood, drop, replay | Naive + mimicry + PGD variants |
-| Primary evasion | Constrained PGD + \(\Pi_{\mathcal{C}}\) + two-pass frame verify | Mimicry required baseline |
+| Primary evasion | **Frame-space** constrained PGD on free bytes + \(\Pi_{\mathcal{C}}\) + re-extract verify | Mimicry required baseline (separate threat model; not gated on PGD \(\Delta\)) |
+| White-box non-goal | Feature-space-only PGD as primary | Historical Phase 1 intent only |
 | Eval protocol | Fixed τ; report TPR naive vs evasive; ΔTPR; secondary metrics (§5); ≥3 seeds; per-family tables | No threshold retune; synthetic disclaimer on all plots |
 | Non-goals | Real car, HIL, SecOC, production IDS | Explicit in README/results |
 
@@ -254,7 +261,7 @@ Only verified entries. Each checked via arXiv / ACM / IEEE / DOI.
 3. Train MLP-AE on NORMAL; freeze; set τ = p99(NORMAL val).  
 4. Naive attack eval → baseline TPR table.  
 5. Mimicry morpher → TPR + objective retention.  
-6. Constrained PGD + projection + two-pass → TPR + objective retention.  
+6. Frame-space constrained PGD (free-byte \(\Pi_{\mathcal{C}}\)) + re-extract → TPR + objective retention.  
 7. Write results with synthetic caveats; no citation invention.
 
 ### Open uncertainties (do not block Phase 2)
