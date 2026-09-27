@@ -14,20 +14,37 @@ under the threshold.
 ## Results (seeds 0–2; see `results/report.md`)
 
 Primary operating point: **τ = p99 reconstruction MSE on held-out NORMAL
-calibration only** (never attack/test; never retuned on attacks).
+calibration only** (never attack/test; never retuned on attacks). Calibration:
+ordered independent NORMAL blocks (12×200s: 6 train / 1 earlystop / 3 calib→τ=p99
+/ 2 test). Fresh FPR stream seed = `seed+777`.
 
-| Story | What to look for |
+### Gate status (honest)
+
+| Gate | Status |
 | --- | --- |
-| **(a) Injection mimicry @ τ** | Gated naive→mimicry ΔTPR at fixed NORMAL-derived τ, with objective retention and 0 constraint violations. Headline only if predeclared gates pass (naive≥20%/seed, mean Δ≥10pp, Δ>0 all seeds); otherwise report actual rates honestly. |
-| **(b) Blind spot** | Replay / spoof low naive TPR — stateless window features miss in-range on-schedule attacks (detector limitation, not an evasion win). |
-| **(c) Flood / drop** | Not evadable under objective (recon ≫ τ). Frame-space PGD does not change that — say **not evadable**, not “PGD failed.” |
+| Fresh-NORMAL FPR @ τ | **PASS** — per seed `[0.0068, 0.0118, 0.0182]`, mean±std **0.0123 ± 0.0047** |
+| Injection mimicry all-seed headline | **FAIL** — seed2 Δ=0 (honest null); mean Δ still positive |
+| **GATES_PASS (win claim)** | **False** — FPR PASS + inj FAIL; no all-seed evasion win claimed |
 
-**PGD** is reported per-family with `n_true_pgd` window counts; zero / null Δ is an
-honest outcome (thinning ≠ PGD; no never-worse clamp). Matched 1% FPR ROC point is
-**secondary/diagnostic only**.
+Matched 1% FPR is **secondary/diagnostic only**.
 
-Numbers: **`results/report.md`** and **`results/aggregate.json`** (regenerate with the
-pipeline — do not trust stale copy-paste).
+### Headlines
+
+**(a) Injection mimicry @ τ** — per-seed (naive / mim / Δ / obj retention):
+
+| Seed | Naive TPR | Mimicry TPR | Δ | Obj retention |
+| --- | ---: | ---: | ---: | ---: |
+| 0 | 1.0000 | 0.8286 | 0.1714 | 0.875 |
+| 1 | 1.0000 | 0.6786 | 0.3214 | 0.700 |
+| 2 | 1.0000 | 1.0000 | **0.0000** | 0.700 |
+
+Mean naive → mimicry: **1.0000 → 0.8357** (Δ **0.1643**); mean obj retention **0.758**; constraint violations **0**. Seed2 Δ=0 is reported as an honest null — no further morph search / no τ retune.
+
+**(b) Replay / spoof blind spot** — replay naive TPR @ τ **0.0167**, spoof **0.0000** (mimicry identical). Stateless window features miss in-range on-schedule payload attacks (detector limitation, not an evasion win).
+
+**(c) Flood / drop not evadable under objective** — naive recon ≫ τ (~618 flood / ~714 drop vs τ ~0.53). Frame-space PGD cannot close that gap while retaining the objective (`true_pgd` TPR still **1.0**, Δ **0**, `n_true_pgd`=40/seed). Say **not evadable**, not “PGD failed.”
+
+**PGD** is reported per-family with `n_true_pgd`; zero / null Δ is honest (thinning ≠ PGD; no never-worse clamp). Full tables: `results/report.md` + `results/aggregate.json`.
 
 ## Reproduce
 
@@ -53,8 +70,8 @@ pytest -q
 
 ## Honesty rules
 
-- τ from held-out **NORMAL** only (never attack/test).
+- τ from held-out **NORMAL** only (never attack/test; never attack-tuned).
 - Fresh-NORMAL FPR uses a **different** seed/stream than train/calib.
 - No never-worse-than-naive clamp on recon MSE.
 - Thinning ≠ PGD (`true_pgd` = frame-space byte PGD with in-loop Π_C only).
-- Report small / null / family-local gaps plainly. Macro Δ hides family structure.
+- Report small / null / family-local gaps plainly (including seed2 Δ=0). Macro Δ hides family structure.
