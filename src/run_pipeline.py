@@ -16,6 +16,25 @@ from src.generate import generate_normal
 from src.train import run_training_pipeline
 
 
+def _json_safe(obj):
+    """Convert NaN/Inf to None for strict JSON."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float) and (obj != obj or obj in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        if v != v or v in (float("inf"), float("-inf")):
+            return None
+        return v
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    return obj
+
+
+
 def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: int = 50) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     train = run_training_pipeline(
@@ -62,7 +81,7 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: in
         "evasion": evasion,
         "disclaimer": "synthetic only — not a real vehicle bus",
     }
-    (out_dir / f"summary_seed{seed}.json").write_text(json.dumps(summary, indent=2))
+    (out_dir / f"summary_seed{seed}.json").write_text(json.dumps(_json_safe(summary), indent=2))
     return summary
 
 
@@ -172,15 +191,18 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
         "Primary TPR / ΔTPR require `objective_retained`. Constrained PGD headline",
         "further requires path=`true_pgd` (rate-thinning is **not** counted as PGD).",
-        "Ungated numbers are secondary only.",
+        "Ungated numbers are secondary only. Families with zero true_pgd windows",
+        "contribute `nan` to the PGD headline (not imputed as success).",
         "",
         "| Method | TPR (gated) | ΔTPR vs naive | Mean recon MSE |",
         "| --- | ---: | ---: | ---: |",
-        f"| Naive (obj-gated / PGD-matched) | {_fmt(m.get('tpr_naive_pgd_matched', m['tpr_naive']))} | — | {_fmt(m['mean_recon_naive'], 6)} |",
-        f"| Mimicry | {_fmt(m['tpr_mimicry'])} | {_fmt(m['delta_tpr_mimicry'])} | {_fmt(m['mean_recon_mimicry'], 6)} |",
-        f"| Constrained PGD (true_pgd) | {_fmt(m['tpr_pgd'])} | {_fmt(m['delta_tpr_pgd'])} | {_fmt(m['mean_recon_pgd'], 6)} |",
+        f"| Naive (obj-gated) | {_fmt(m['tpr_naive'])} | — | {_fmt(m['mean_recon_naive'], 6)} |",
+        f"| Mimicry (obj-gated) | {_fmt(m['tpr_mimicry'])} | {_fmt(m['delta_tpr_mimicry'])} | {_fmt(m['mean_recon_mimicry'], 6)} |",
+        f"| Naive (true_pgd-matched) | {_fmt(m.get('tpr_naive_pgd_matched'))} | — | "
+        f"(matched windows only) |",
+        f"| Constrained PGD (true_pgd ∩ obj) | {_fmt(m['tpr_pgd'])} | {_fmt(m['delta_tpr_pgd'])} | {_fmt(m['mean_recon_pgd'], 6)} |",
         "",
-        f"**Headline ΔTPR (naive − true_pgd, objective-gated):** `{_fmt(m['delta_tpr_pgd'])}`",
+        f"**Headline ΔTPR (true_pgd-matched naive − true_pgd, objective-gated):** `{_fmt(m['delta_tpr_pgd'])}`",
         "",
         "### PGD path counts (mean windows / family / seed)",
         "",
@@ -282,7 +304,7 @@ def main() -> None:
         print(f"=== seed {seed} ===")
         summaries.append(run_seed(seed, out))
     agg = aggregate(summaries)
-    (out / "aggregate.json").write_text(json.dumps(agg, indent=2))
+    (out / "aggregate.json").write_text(json.dumps(_json_safe(agg), indent=2))
     write_report(agg, summaries, out / "report.md")
     print("Wrote", out / "report.md")
     print(json.dumps(agg["macro"], indent=2))
