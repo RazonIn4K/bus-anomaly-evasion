@@ -272,6 +272,9 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         f"**{_fmt(agg['fpr_fresh_normal_mean'])} ± {_fmt(agg['fpr_fresh_normal_std'])}** "
         f"(gates: std<1pp={agg.get('gate_fpr_std_ok')}, mean≤1.5%={agg.get('gate_fpr_mean_ok')}, "
         f"max≤2.5%={agg.get('gate_fpr_max_ok')})",
+        f"- **gate_fpr_all_ok={agg.get('gate_fpr_all_ok')}** · "
+        f"**gate_injection_headline_ok={agg.get('gate_injection_headline_ok')}** · "
+        f"**GATES_PASS (win claim)={bool(agg.get('gate_fpr_all_ok') and agg.get('gate_injection_headline_ok'))}**",
         f"- Mean τ (p99 held-out NORMAL val) — **primary**: `{agg['tau_mean']:.6f}`",
         f"- Secondary τ @ matched 1% FPR (fresh-NORMAL ROC; diagnostic): "
         f"`{_fmt(agg.get('tau_fpr1_matched_mean'), 6)}`",
@@ -294,8 +297,7 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         (
             "- **Headline:** injection mimicry reduces detection at fixed NORMAL-derived τ."
             if agg.get("gate_injection_headline_ok")
-            else "- **No robust evasion headline:** config did not meet predeclared "
-                 "injection@τ gates; reporting actual rates (not a forced win)."
+            else "- **Honest null / no all-seed win claim:** all-seed injection mimicry headline gate FAILED (see per-seed Δ; zeros allowed). FPR gate status above. Reporting actual rates — not a forced win."
         ),
         f"- Secondary/diagnostic matched 1% FPR (not primary): naive "
         f"**{_fmt(inj.get('tpr_naive_fpr1'))}** → mimicry **{_fmt(inj.get('tpr_mimicry_fpr1'))}** "
