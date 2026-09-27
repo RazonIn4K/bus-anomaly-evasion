@@ -60,7 +60,7 @@ def test_train_pipeline_deterministic_tau(tmp_path):
     assert r1["meta"]["n_val"] > 0
     # FPR on held-out NORMAL test should be near 1%
     assert 0.0 <= r1["meta"]["fpr_test_normal"] <= 0.15
-    assert r1["meta"]["tau_calibration_split"] == "dedicated_held_out_NORMAL_val_stream"
+    assert r1["meta"]["tau_calibration_split"] == "temporal_held_out_NORMAL_val"
 
 
 def test_model_architecture():

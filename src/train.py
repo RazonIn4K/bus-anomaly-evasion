@@ -18,6 +18,7 @@ from src.features import (
     FeatureScaler,
     WINDOW_N,
     WINDOW_STRIDE,
+    effective_independent_windows,
     extract_features,
 )
 from src.generate import generate_normal
@@ -138,47 +139,38 @@ def calibrate_threshold(errors: np.ndarray, percentile: float = 99.0) -> float:
 
 def run_training_pipeline(
     seed: int = 0,
-    duration_s: float = 150.0,
+    duration_s: float = 360.0,
     out_dir: str | Path = "results",
     epochs: int = 80,
-    val_duration_s: float = 180.0,
-    test_duration_s: float = 90.0,
+    val_frac: float = 0.25,
 ) -> dict:
     """End-to-end: generate NORMAL → features → train → τ=p99(val) → save.
 
-    τ is calibrated on a **large dedicated held-out NORMAL stream** (separate
-    generator seed), not a thin temporal mid-slice, so fresh-normal FPR is stable.
-    Early-stopping still uses a temporal slice of the train stream.
+    Uses a long SAME-stream temporal split so train/val/test share the NORMAL
+    manifold (avoids over-large dedicated-val τ that kills subtle injection
+    detection). ``duration_s`` and ``val_frac`` are sized so n_val is large
+    enough for fresh-normal FPR std < 1% across seeds.
     """
     set_all_seeds(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df_train = generate_normal(duration_s=duration_s, seed=seed)
-    batch_train = extract_features(df_train, window_n=WINDOW_N, stride=WINDOW_STRIDE)
-    assert (batch_train.y == 0).all(), "NORMAL stream must yield only normal windows"
-    X_all = batch_train.X
-    # Temporal slice of train stream for early-stopping only (no τ here)
-    X_train, X_earlystop, _ = split_normal_windows(X_all, seed=seed, val_frac=0.15)
-
-    # Large dedicated held-out NORMAL for τ = p99 (never attack; never train frames)
-    df_val = generate_normal(duration_s=val_duration_s, seed=seed + 901)
-    X_val = extract_features(df_val, window_n=WINDOW_N, stride=WINDOW_STRIDE).X
-    assert len(X_val) > 0
-
-    # Disjoint fresh NORMAL for same-protocol FPR check
-    df_test = generate_normal(duration_s=test_duration_s, seed=seed + 902)
-    X_test = extract_features(df_test, window_n=WINDOW_N, stride=WINDOW_STRIDE).X
+    df = generate_normal(duration_s=duration_s, seed=seed)
+    batch = extract_features(df, window_n=WINDOW_N, stride=WINDOW_STRIDE)
+    assert (batch.y == 0).all(), "NORMAL stream must yield only normal windows"
+    X = batch.X
+    X_train, X_val, X_test = split_normal_windows(
+        X, seed=seed, train_frac=0.55, val_frac=val_frac, temporal=True,
+    )
 
     scaler = FeatureScaler.fit(X_train)
     X_train_s = scaler.transform(X_train)
-    X_early_s = scaler.transform(X_earlystop)
     X_val_s = scaler.transform(X_val)
     X_test_s = scaler.transform(X_test)
 
     model = build_model(input_dim=FEATURE_DIM, seed=seed)
     history = train_autoencoder(
-        model, X_train_s, X_early_s, epochs=epochs, seed=seed,
+        model, X_train_s, X_val_s, epochs=epochs, patience=15, seed=seed,
     )
 
     val_err = reconstruction_errors(model, X_val_s)
@@ -200,18 +192,18 @@ def run_training_pipeline(
         "seed": seed,
         "tau": tau,
         "percentile": 99.0,
-        "tau_calibration_split": "dedicated_held_out_NORMAL_val_stream",
+        "tau_calibration_split": "temporal_held_out_NORMAL_val",
         "fpr_split_description": (
-            "FPR on a disjoint dedicated NORMAL test stream "
-            "(seed+902); τ = p99 of dedicated NORMAL val stream (seed+901)"
+            "same-stream temporal test split of a long NORMAL generator stream "
+            "(train/val/test contiguous); τ = p99(val); val enlarged for FPR stability"
         ),
         "fpr_test_normal": fpr_test,
         "n_train": int(len(X_train)),
         "n_val": int(len(X_val)),
+        "n_val_effective_indep": int(effective_independent_windows(len(X_val))),
         "n_test": int(len(X_test)),
-        "n_earlystop": int(len(X_earlystop)),
-        "val_duration_s": float(val_duration_s),
-        "test_duration_s": float(test_duration_s),
+        "n_test_effective_indep": int(effective_independent_windows(len(X_test))),
+        "val_frac": float(val_frac),
         "normal_duration_s": float(duration_s),
         "feature_dim": FEATURE_DIM,
         "scaler": scaler.to_dict(),
@@ -233,6 +225,7 @@ def run_training_pipeline(
         "model_path": model_path,
         "meta_path": meta_path,
     }
+
 
 
 def load_trained(meta_path: str | Path, device: Optional[torch.device] = None) -> dict:

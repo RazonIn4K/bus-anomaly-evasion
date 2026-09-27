@@ -17,6 +17,7 @@ from src.evaluate import (
     matched_fpr_threshold,
     scores_for_frames,
 )
+from src.features import effective_independent_windows
 from src.generate import generate_normal
 from src.train import run_training_pipeline
 
@@ -40,15 +41,14 @@ def _json_safe(obj):
 
 
 
-def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: int = 50,
-                 val_duration_s: float = 180.0) -> dict:
+def run_seed(seed: int, out_dir: Path, duration_normal: float = 360.0, epochs: int = 60) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     train = run_training_pipeline(
         seed=seed,
         duration_s=duration_normal,
         out_dir=out_dir,
         epochs=epochs,
-        val_duration_s=val_duration_s,
+        val_frac=0.25,
     )
     model, scaler, tau = train["model"], train["scaler"], train["tau"]
 
@@ -56,7 +56,7 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: i
         model, scaler, tau, seed=seed, duration_s=10.0, normal_duration_s=10.0,
     )
     # Large fresh NORMAL stream for FPR stability + matched 1% FPR threshold (ROC)
-    normal_check = generate_normal(duration_s=120.0, seed=seed + 777)
+    normal_check = generate_normal(duration_s=200.0, seed=seed + 777)
     fpr_stream = evaluate_stream(model, scaler, tau, normal_check)
     fresh_err, fresh_y, _ = scores_for_frames(model, scaler, normal_check)
     # Use NORMAL windows only (y==0); pure normal stream is all zeros
@@ -81,6 +81,8 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: i
             else fpr_stream["alert_rate"]
         ),
         "n_fresh_normal_windows": int(len(normal_errs)),
+        "n_fresh_normal_effective_indep": int(effective_independent_windows(len(normal_errs))),
+        "n_val_effective_indep": int(train["meta"].get("n_val_effective_indep", 0)),
         "tau_fpr1_matched": tau_fpr1,
         "fpr_at_tau_fpr1": fpr_at_tau_fpr1,
         "n_val_windows": int(train["meta"].get("n_val", 0)),
@@ -111,6 +113,21 @@ def aggregate(summaries: list[dict]) -> dict:
     agg["fpr_same_stream_split_std"] = float(np.std(fprs_split))
     agg["fpr_fresh_normal_mean"] = float(np.mean(fprs_fresh))
     agg["fpr_fresh_normal_std"] = float(np.std(fprs_fresh))
+    # Population SD across seeds (ddof=0) for the predeclared gate; also store per-seed
+    agg["fpr_fresh_normal_per_seed"] = [float(x) for x in fprs_fresh]
+    agg["n_val_effective_indep_mean"] = float(np.mean([
+        s.get("n_val_effective_indep", 0) for s in summaries
+    ]))
+    agg["n_fresh_normal_effective_indep_mean"] = float(np.mean([
+        s.get("n_fresh_normal_effective_indep", 0) for s in summaries
+    ]))
+    # Predeclared FPR gates (Zen): SD < 1pp, mean ≤ 1.5%, no seed > 2.5%
+    agg["gate_fpr_std_ok"] = bool(agg["fpr_fresh_normal_std"] < 0.01)
+    agg["gate_fpr_mean_ok"] = bool(agg["fpr_fresh_normal_mean"] <= 0.015)
+    agg["gate_fpr_max_ok"] = bool(max(fprs_fresh) <= 0.025 if fprs_fresh else False)
+    agg["gate_fpr_all_ok"] = bool(
+        agg["gate_fpr_std_ok"] and agg["gate_fpr_mean_ok"] and agg["gate_fpr_max_ok"]
+    )
     # Back-compat aliases (same-stream split)
     agg["fpr_at_tau_mean"] = agg["fpr_same_stream_split_mean"]
     agg["fpr_at_tau_std"] = agg["fpr_same_stream_split_std"]
@@ -183,6 +200,35 @@ def aggregate(summaries: list[dict]) -> dict:
         "true_pgd": agg["macro"]["n_true_pgd"],
         "naive_fallback": agg["macro"]["n_naive_fallback"],
     }
+
+    # Predeclared injection-mimicry@τ headline gate (Zen):
+    # naive≥20% every seed, mean paired Δ≥10pp, Δ>0 all seeds.
+    inj_naive_seeds = []
+    inj_delta_seeds = []
+    for s in summaries:
+        row = s["evasion"].get("injection", {})
+        tn = row.get("tpr_naive")
+        tm = row.get("tpr_mimicry")
+        if isinstance(tn, (int, float)) and tn == tn:
+            inj_naive_seeds.append(float(tn))
+        if isinstance(tn, (int, float)) and isinstance(tm, (int, float)) and tn == tn and tm == tm:
+            inj_delta_seeds.append(float(tn) - float(tm))
+    agg["injection_naive_tpr_per_seed"] = inj_naive_seeds
+    agg["injection_delta_tpr_per_seed"] = inj_delta_seeds
+    agg["gate_injection_naive_min_ok"] = bool(
+        len(inj_naive_seeds) == len(summaries) and all(v >= 0.20 for v in inj_naive_seeds)
+    )
+    agg["gate_injection_delta_mean_ok"] = bool(
+        len(inj_delta_seeds) == len(summaries) and float(np.mean(inj_delta_seeds)) >= 0.10
+    )
+    agg["gate_injection_delta_all_pos_ok"] = bool(
+        len(inj_delta_seeds) == len(summaries) and all(d > 0.0 for d in inj_delta_seeds)
+    )
+    agg["gate_injection_headline_ok"] = bool(
+        agg["gate_injection_naive_min_ok"]
+        and agg["gate_injection_delta_mean_ok"]
+        and agg["gate_injection_delta_all_pos_ok"]
+    )
     return agg
 
 
@@ -211,30 +257,44 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
         f"- Seeds: `{agg['seeds']}`",
         f"- Threshold rule: τ = p99 MSE on held-out NORMAL validation (never attack/test).",
-        f"- τ calibration split: **`{cal}`** (dedicated held-out NORMAL val stream).",
-        f"- Mean val windows / seed: **{_fmt(agg.get('n_val_windows_mean'), 1)}**",
+        f"- τ calibration split: **`{cal}`** (temporal early/mid/late contiguous windows; enlarged val).",
+        f"- Mean val windows / seed: **{_fmt(agg.get('n_val_windows_mean'), 1)}** "
+        f"(effective indep ≈ **{_fmt(agg.get('n_val_effective_indep_mean'), 1)}**)",
         f"- Same-stream split FPR (mean±std): "
         f"**{_fmt(agg['fpr_same_stream_split_mean'])} ± {_fmt(agg['fpr_same_stream_split_std'])}**",
+        f"- Fresh-normal FPR @ τ per seed: `{agg.get('fpr_fresh_normal_per_seed')}`",
         f"- Fresh-normal FPR @ τ (mean±std): "
-        f"**{_fmt(agg['fpr_fresh_normal_mean'])} ± {_fmt(agg['fpr_fresh_normal_std'])}**",
-        f"- Mean τ (p99 val): `{agg['tau_mean']:.6f}`",
-        f"- Mean τ @ matched 1% FPR (fresh-NORMAL ROC): "
+        f"**{_fmt(agg['fpr_fresh_normal_mean'])} ± {_fmt(agg['fpr_fresh_normal_std'])}** "
+        f"(gates: std<1pp={agg.get('gate_fpr_std_ok')}, mean≤1.5%={agg.get('gate_fpr_mean_ok')}, "
+        f"max≤2.5%={agg.get('gate_fpr_max_ok')})",
+        f"- Mean τ (p99 held-out NORMAL val) — **primary**: `{agg['tau_mean']:.6f}`",
+        f"- Secondary τ @ matched 1% FPR (fresh-NORMAL ROC; diagnostic): "
         f"`{_fmt(agg.get('tau_fpr1_matched_mean'), 6)}`",
         f"- Fresh-NORMAL windows / seed (mean): "
-        f"**{_fmt(agg.get('n_fresh_normal_windows_mean'), 1)}**",
+        f"**{_fmt(agg.get('n_fresh_normal_windows_mean'), 1)}** "
+        f"(effective indep ≈ **{_fmt(agg.get('n_fresh_normal_effective_indep_mean'), 1)}**)",
         "",
         "## Headlines (read these first)",
         "",
-        "### (a) Injection mimicry works",
+        "### (a) Injection mimicry @ τ (primary = held-out NORMAL p99)",
         "",
-        f"- Naive injection TPR (obj-gated @ τ): **{_fmt(inj.get('tpr_naive'))}**",
-        f"- Mimicry injection TPR (obj-gated @ τ): **{_fmt(inj.get('tpr_mimicry'))}** "
-        f"(ΔTPR **{_fmt(inj.get('delta_tpr_mimicry'))}**)",
-        f"- Same at matched 1% FPR: naive **{_fmt(inj.get('tpr_naive_fpr1'))}** → "
-        f"mimicry **{_fmt(inj.get('tpr_mimicry_fpr1'))}** "
-        f"(Δ **{_fmt(inj.get('delta_tpr_mimicry_fpr1'))}**)",
+        f"- Gate headline_ok: **{agg.get('gate_injection_headline_ok')}** "
+        f"(naive≥20%/seed, mean Δ≥10pp, Δ>0 all seeds)",
+        f"- Per-seed naive TPR: `{agg.get('injection_naive_tpr_per_seed')}`",
+        f"- Per-seed ΔTPR (naive−mim): `{agg.get('injection_delta_tpr_per_seed')}`",
+        f"- Mean naive → mimicry @ τ: **{_fmt(inj.get('tpr_naive'))}** → "
+        f"**{_fmt(inj.get('tpr_mimicry'))}** (Δ **{_fmt(inj.get('delta_tpr_mimicry'))}**)",
         f"- Objective retention (mimicry): **{_fmt(inj.get('obj_retention_mimicry'), 3)}**; "
         f"constraint violations: **{_fmt(inj.get('constraint_viol_mimicry'), 3)}**",
+        (
+            "- **Headline:** injection mimicry reduces detection at fixed NORMAL-derived τ."
+            if agg.get("gate_injection_headline_ok")
+            else "- **No robust evasion headline:** config did not meet predeclared "
+                 "injection@τ gates; reporting actual rates (not a forced win)."
+        ),
+        f"- Secondary/diagnostic matched 1% FPR (not primary): naive "
+        f"**{_fmt(inj.get('tpr_naive_fpr1'))}** → mimicry **{_fmt(inj.get('tpr_mimicry_fpr1'))}** "
+        f"(Δ **{_fmt(inj.get('delta_tpr_mimicry_fpr1'))}**).",
         "",
         "### (b) Detector blind spot: replay / spoof",
         "",
