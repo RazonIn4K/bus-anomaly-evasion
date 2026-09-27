@@ -20,10 +20,10 @@
 
 ### (0) Key finding — structure over payload (scoped)
 
-> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from `results/aggregate.json`:
+> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from tracked `results/report.md` (pipeline-generated `results/aggregate.json` is not tracked):
 > - **Spoof / replay:** naive mean recon ≈**0.23** ≪ τ≈**0.53**, so payload-only attacks are largely invisible here (spoof naive TPR **0.0000**; replay naive TPR **0.0167** — tiny, not absolute zero).
-> - **Frame-space PGD (injection):** lowers recon in ~**99%** of injection windows (`frac_improved` **0.99**) but mean recon stays above τ (**1.38** vs **0.53**) under free-byte + objective freeze — a ceiling for *this* attack class and constraint set, not a claim that white-box payload PGD is impossible in general.
-> - **Mimicry:** the only rate-shaping family that partly reduces detection — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop still dominate structural features and stay non-evadable while keeping their objective under the tested constraints.
+> - **Frame-space PGD (injection):** reduced recon in ~**99%** of injection windows (`frac_improved` **0.99**) but produced **no observed TPR reduction** (mean recon **1.38** still > τ≈**0.53**) under free-byte + objective freeze in these runs.
+> - **Mimicry:** the only rate-shaping family that partly reduces detection — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop remained detected in the evaluated runs under the tested constraints; these results do not establish that evasion is impossible.
 > Gate status unchanged: **GATES_PASS=False** (FPR PASS; all-seed inj FAIL).
 
 
@@ -44,10 +44,12 @@ Stateless window features miss in-range, on-schedule payload attacks.
 - Spoof naive TPR @ τ: **0.0000** (mimicry **0.0000**)
 Low TPR here is a detector limitation, not an evasion win.
 
-### (c) Flood / drop not evadable under the objective
+### (c) Flood / drop remained detected under tested constraints
 
 Rate attacks dominate reconstruction via count/IAT features. Typical naive
-recon MSE is ~618.5 (flood) / ~713.8 (drop) vs τ ~ 0.53. Frame-space byte PGD cannot close that gap while retaining the objective — say **not evadable under objective**, not “PGD failed.”
+recon MSE is ~618.5 (flood) / ~713.8 (drop) vs τ ~ 0.53. In the evaluated runs,
+frame-space byte PGD left true_pgd TPR at 1.0 while retaining the objective.
+Observed outcome only — these results do not establish that evasion is impossible.
 - Flood true_pgd TPR @ τ: **1.0000** (Δ **0.0000**, n_true_pgd=40.0)
 - Drop true_pgd TPR @ τ: **1.0000** (Δ **0.0000**, n_true_pgd=40.0)
 
@@ -81,7 +83,7 @@ n_true_pgd is mean windows / seed labeled frame-space PGD.
 ## Honest gaps
 
 - Macro ΔTPR across families can obscure the partial, seed-dependent
-  injection mimicry reduction and the flood/drop non-evasion — read the
+  injection mimicry reduction and the flood/drop remaining detected under tested constraints — read the
   headlines (including scoped key finding) and per-family table.
 - Fresh-normal FPR std target is < 1% after enlarging val / fresh streams;
   residual deviation is reported above, not clamped.
