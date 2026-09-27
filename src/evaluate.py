@@ -140,3 +140,15 @@ def evaluate_naive_attacks(
 
 def delta_tpr(tpr_naive: float, tpr_evasive: float) -> float:
     return float(tpr_naive - tpr_evasive)
+
+
+def matched_fpr_threshold(normal_errors: np.ndarray, target_fpr: float = 0.01) -> float:
+    """Threshold achieving empirical FPR ≈ target on a NORMAL error set (ROC point).
+
+    Equivalent to the (1 - target_fpr) quantile. Distinct from τ when the
+    calibration val set and this NORMAL set differ; used to report TPR at a
+    matched 1% FPR operating point alongside τ = p99(val).
+    """
+    if len(normal_errors) == 0:
+        return float("nan")
+    return float(np.percentile(normal_errors, 100.0 * (1.0 - target_fpr)))

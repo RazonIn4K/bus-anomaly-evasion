@@ -33,7 +33,7 @@ def split_normal_windows(
     X: np.ndarray,
     seed: int = 0,
     train_frac: float = 0.7,
-    val_frac: float = 0.15,
+    val_frac: float = 0.20,
     temporal: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Split NORMAL windows into train / val / test (disjoint).
@@ -138,7 +138,7 @@ def calibrate_threshold(errors: np.ndarray, percentile: float = 99.0) -> float:
 
 def run_training_pipeline(
     seed: int = 0,
-    duration_s: float = 60.0,
+    duration_s: float = 150.0,
     out_dir: str | Path = "results",
     epochs: int = 80,
 ) -> dict:
@@ -191,6 +191,8 @@ def run_training_pipeline(
         "n_train": int(len(X_train)),
         "n_val": int(len(X_val)),
         "n_test": int(len(X_test)),
+        "val_frac": 0.20,
+        "normal_duration_s": float(duration_s),
         "feature_dim": FEATURE_DIM,
         "scaler": scaler.to_dict(),
         "history": {

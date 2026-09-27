@@ -11,7 +11,12 @@ from pathlib import Path
 import numpy as np
 
 from src.attack import run_evasion_suite
-from src.evaluate import evaluate_naive_attacks, evaluate_stream
+from src.evaluate import (
+    evaluate_naive_attacks,
+    evaluate_stream,
+    matched_fpr_threshold,
+    scores_for_frames,
+)
 from src.generate import generate_normal
 from src.train import run_training_pipeline
 
@@ -35,7 +40,7 @@ def _json_safe(obj):
 
 
 
-def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: int = 50) -> dict:
+def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: int = 50) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     train = run_training_pipeline(
         seed=seed,
@@ -48,12 +53,17 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: in
     naive = evaluate_naive_attacks(
         model, scaler, tau, seed=seed, duration_s=10.0, normal_duration_s=10.0,
     )
-    # FPR check on pure NORMAL test stream (already in meta); also score fresh normal
-    normal_check = generate_normal(duration_s=15.0, seed=seed + 777)
+    # Large fresh NORMAL stream for FPR stability + matched 1% FPR threshold (ROC)
+    normal_check = generate_normal(duration_s=60.0, seed=seed + 777)
     fpr_stream = evaluate_stream(model, scaler, tau, normal_check)
+    fresh_err, fresh_y, _ = scores_for_frames(model, scaler, normal_check)
+    # Use NORMAL windows only (y==0); pure normal stream is all zeros
+    normal_errs = fresh_err[fresh_y == 0] if (fresh_y == 0).any() else fresh_err
+    tau_fpr1 = matched_fpr_threshold(normal_errs, target_fpr=0.01)
+    fpr_at_tau_fpr1 = float((normal_errs > tau_fpr1).mean()) if len(normal_errs) else float("nan")
 
     evasion = run_evasion_suite(
-        model, scaler, tau, seed=seed, duration_s=10.0,
+        model, scaler, tau, seed=seed, duration_s=10.0, tau_fpr1=tau_fpr1,
     )
 
     summary = {
@@ -68,6 +78,10 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: in
             fpr_stream["fpr"] if fpr_stream["fpr"] == fpr_stream["fpr"]
             else fpr_stream["alert_rate"]
         ),
+        "n_fresh_normal_windows": int(len(normal_errs)),
+        "tau_fpr1_matched": tau_fpr1,
+        "fpr_at_tau_fpr1": fpr_at_tau_fpr1,
+        "n_val_windows": int(train["meta"].get("n_val", 0)),
         "naive_overall_tpr": naive["tpr"],
         "naive_roc_auc": naive["roc_auc"],
         "naive_family_tables": {
@@ -99,6 +113,11 @@ def aggregate(summaries: list[dict]) -> dict:
     agg["fpr_at_tau_mean"] = agg["fpr_same_stream_split_mean"]
     agg["fpr_at_tau_std"] = agg["fpr_same_stream_split_std"]
     agg["tau_mean"] = float(np.mean([s["tau"] for s in summaries]))
+    agg["tau_fpr1_matched_mean"] = float(np.mean([s["tau_fpr1_matched"] for s in summaries]))
+    agg["n_val_windows_mean"] = float(np.mean([s.get("n_val_windows", 0) for s in summaries]))
+    agg["n_fresh_normal_windows_mean"] = float(
+        np.mean([s.get("n_fresh_normal_windows", 0) for s in summaries])
+    )
     agg["tau_calibration_split"] = summaries[0].get(
         "tau_calibration_split", "temporal_held_out_NORMAL_val"
     )
@@ -106,6 +125,8 @@ def aggregate(summaries: list[dict]) -> dict:
     keys = [
         "tpr_naive", "tpr_naive_pgd_matched", "tpr_mimicry", "tpr_pgd",
         "delta_tpr_mimicry", "delta_tpr_pgd",
+        "tpr_naive_fpr1", "tpr_mimicry_fpr1", "tpr_naive_pgd_matched_fpr1", "tpr_pgd_fpr1",
+        "delta_tpr_mimicry_fpr1", "delta_tpr_pgd_fpr1",
         "tpr_naive_ungated", "tpr_mimicry_ungated", "tpr_pgd_ungated",
         "delta_tpr_mimicry_ungated", "delta_tpr_pgd_ungated",
         "mean_recon_naive", "mean_recon_mimicry", "mean_recon_pgd",
@@ -121,6 +142,8 @@ def aggregate(summaries: list[dict]) -> dict:
         "tpr_naive", "tpr_mimicry", "tpr_pgd",
         "tpr_naive_pgd_matched",
         "delta_tpr_mimicry", "delta_tpr_pgd",
+        "tpr_naive_fpr1", "tpr_mimicry_fpr1", "tpr_pgd_fpr1",
+        "delta_tpr_mimicry_fpr1", "delta_tpr_pgd_fpr1",
         "tpr_mimicry_ungated", "tpr_pgd_ungated",
         "delta_tpr_mimicry_ungated", "delta_tpr_pgd_ungated",
         "mean_recon_naive", "mean_recon_mimicry", "mean_recon_pgd",

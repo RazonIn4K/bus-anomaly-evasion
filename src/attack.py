@@ -724,6 +724,7 @@ def run_evasion_suite(
     tau: float,
     seed: int = 0,
     duration_s: float = 10.0,
+    tau_fpr1: float | None = None,
 ) -> dict:
     from src.generate import ATTACK_FAMILIES, generate_attack, generate_normal
     from src.evaluate import detection_rate
@@ -766,6 +767,21 @@ def run_evasion_suite(
             path_labels=pgd.path_labels, require_path=PATH_TRUE_PGD,
         )
 
+        # Matched 1% FPR operating point (from fresh-NORMAL ROC), if provided
+        if tau_fpr1 is not None and tau_fpr1 == tau_fpr1:
+            tpr_naive_fpr1 = gated_detection_rate(mim.naive_errors, tau_fpr1, mim.retained_mask)
+            tpr_mim_fpr1 = gated_detection_rate(mim.evasive_errors, tau_fpr1, mim.retained_mask)
+            tpr_naive_pgd_fpr1 = gated_detection_rate(
+                pgd.naive_errors, tau_fpr1, pgd.retained_mask,
+                path_labels=pgd.path_labels, require_path=PATH_TRUE_PGD,
+            )
+            tpr_pgd_fpr1 = gated_detection_rate(
+                pgd.evasive_errors, tau_fpr1, pgd.retained_mask,
+                path_labels=pgd.path_labels, require_path=PATH_TRUE_PGD,
+            )
+        else:
+            tpr_naive_fpr1 = tpr_mim_fpr1 = tpr_naive_pgd_fpr1 = tpr_pgd_fpr1 = float("nan")
+
         # Mean recon on true_pgd windows only (PGD headline honesty)
         pgd_mask = (pgd.path_labels == PATH_TRUE_PGD) if len(pgd.path_labels) else np.zeros(0, dtype=bool)
         if pgd_mask.any():
@@ -804,6 +820,15 @@ def run_evasion_suite(
             "tpr_pgd": tpr_pgd,
             "delta_tpr_mimicry": _delta(tpr_naive if tpr_naive == tpr_naive else tpr_naive_ungated, tpr_mim),
             "delta_tpr_pgd": _delta(tpr_naive_pgd_gate, tpr_pgd),
+            # Matched 1% FPR (ROC) operating point
+            "tpr_naive_fpr1": tpr_naive_fpr1 if tpr_naive_fpr1 == tpr_naive_fpr1 else tpr_naive_ungated,
+            "tpr_mimicry_fpr1": tpr_mim_fpr1,
+            "tpr_naive_pgd_matched_fpr1": tpr_naive_pgd_fpr1,
+            "tpr_pgd_fpr1": tpr_pgd_fpr1,
+            "delta_tpr_mimicry_fpr1": _delta(
+                tpr_naive_fpr1 if tpr_naive_fpr1 == tpr_naive_fpr1 else float("nan"), tpr_mim_fpr1,
+            ),
+            "delta_tpr_pgd_fpr1": _delta(tpr_naive_pgd_fpr1, tpr_pgd_fpr1),
             # Secondary ungated
             "tpr_naive_ungated": tpr_naive_ungated,
             "tpr_mimicry_ungated": tpr_mim_ungated,
