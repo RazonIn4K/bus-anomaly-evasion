@@ -446,10 +446,53 @@ def _score_mimicry_params(
     m = min(len(n_err), len(e_err))
     score = float(np.mean(e_err[:m]))
     ret_mean = float(np.mean(retained[:m])) if m else 0.0
+    # Soft retention signal only (tiered selection in _select_mimicry_params is authoritative)
     if ret_mean < 0.7:
-        score += 1e3  # heavily penalize objective collapse
+        score += 10.0 * (0.7 - ret_mean)
     viol = [constraint_violations(e_feat[i]) > 0 for i in range(m)]
     return score, (n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
+
+
+def _select_mimicry_params(
+    model: Autoencoder,
+    scaler: FeatureScaler,
+    select_stream: pd.DataFrame,
+    family: str,
+    nb: dict,
+    rng: np.random.Generator,
+) -> Optional[dict]:
+    """Choose grid params on select_stream without hard-penalizing into identity.
+
+    Tier 1: among candidates with obj retention ≥ 0.7, minimize mean recon.
+    Tier 2: if empty, among *non-identity* morphs with retention ≥ 0.5, maximize
+            retention then minimize recon (avoids seed0 identity collapse when
+            select-stream retention sits just under 0.7).
+    Tier 3: identity / lowest recon fallback.
+    """
+    scored: list[tuple[Optional[dict], float, float]] = []
+    for params in _mimicry_grid():
+        score, packed = _score_mimicry_params(
+            model, scaler, select_stream, family, params, nb, rng,
+        )
+        if packed is None or score == float("inf"):
+            continue
+        # Undo hard penalty inside _score for tiering; use raw recon + ret
+        _n_e, e_e, _n_f, _e_f, ret, _viol = packed
+        mean_recon = float(np.mean(e_e)) if len(e_e) else float("inf")
+        ret_mean = float(np.mean(ret)) if len(ret) else 0.0
+        scored.append((params, mean_recon, ret_mean))
+    if not scored:
+        return None
+    # Prefer real morphs; identity always has ret=1 and must not dominate tier1.
+    tier1 = [s for s in scored if s[0] is not None and s[2] >= 0.7]
+    if tier1:
+        return min(tier1, key=lambda s: s[1])[0]
+    tier2 = [s for s in scored if s[0] is not None and s[2] >= 0.5]
+    if tier2:
+        # max retention, then min recon
+        return min(tier2, key=lambda s: (-s[2], s[1]))[0]
+    # Last resort: identity (or whatever has lowest recon)
+    return min(scored, key=lambda s: s[1])[0]
 
 
 def mimicry_evade(
@@ -470,18 +513,11 @@ def mimicry_evade(
     rng_select = np.random.default_rng(seed)
     rng_score = np.random.default_rng(seed + 7919)
     nb = estimate_normal_byte_means(normal_df)
-    grid = _mimicry_grid()
     select_stream = select_df if select_df is not None else attack_df
 
-    best_params = None
-    best_select_score = float("inf")
-    for params in grid:
-        score, _ = _score_mimicry_params(
-            model, scaler, select_stream, family, params, nb, rng_select,
-        )
-        if score < best_select_score:
-            best_select_score = score
-            best_params = params
+    best_params = _select_mimicry_params(
+        model, scaler, select_stream, family, nb, rng_select,
+    )
 
     # Fresh RNG for scoring morph so thinning draws are independent of select
     _, packed = _score_mimicry_params(
