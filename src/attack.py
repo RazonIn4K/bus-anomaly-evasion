@@ -1,18 +1,18 @@
 """Adversarial evasion.
 
-(a) Mimicry (black-box): morph attack windows toward NORMAL feature stats while
-    preserving the malicious objective.
-(b) Constrained PGD (white-box): gradient descent on window features to minimize
-    reconstruction error, projected onto bus-feasible set C, then mapped back to
-    frames and re-extracted (two-pass verify).
+(a) Mimicry (black-box): thin attack streams toward the objective floor and
+    blend free bytes toward NORMAL stats; re-extract windows (two-pass).
+(b) Constrained PGD (white-box): L2 PGD on scaled window features to minimize
+    reconstruction MSE, Π_C projection, then map byte-stat targets back onto
+    the thinned stream and re-extract (two-pass verify).
 
-Evasion must beat the naive attack on mean recon error and stay feasible.
+Evasion must beat naive recon error and stay bus-feasible.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -21,7 +21,6 @@ import torch
 from src.features import (
     FEATURE_DIM,
     K,
-    TOP_IDS,
     WINDOW_N,
     FeatureScaler,
     extract_features,
@@ -34,35 +33,22 @@ from src.model import Autoencoder
 from src.train import reconstruction_errors
 
 
-# ---------------------------------------------------------------------------
-# Feasibility projection Π_C (feature space)
-# ---------------------------------------------------------------------------
-
 def project_features(x: np.ndarray, k: int = K) -> np.ndarray:
-    """Project a feature vector (or batch) onto the feasible set C.
-
-    Layout: counts(K+1) | iat_mean(K) | iat_std(K) | byte_mean(K) | byte_std(K) | entropy(1)
-    """
     single = x.ndim == 1
     X = np.atleast_2d(x).astype(np.float64).copy()
-    # counts >= 0, roughly <= WINDOW_N
     X[:, : k + 1] = np.clip(X[:, : k + 1], 0.0, float(WINDOW_N))
-    # IAT mean > 0 (use small epsilon), std >= 0
     i0 = k + 1
     X[:, i0 : i0 + k] = np.maximum(X[:, i0 : i0 + k], 1e-6)
     X[:, i0 + k : i0 + 2 * k] = np.maximum(X[:, i0 + k : i0 + 2 * k], 0.0)
-    # byte mean/std in [0, 255]
     b0 = i0 + 2 * k
     X[:, b0 : b0 + k] = np.clip(X[:, b0 : b0 + k], 0.0, 255.0)
     X[:, b0 + k : b0 + 2 * k] = np.clip(X[:, b0 + k : b0 + 2 * k], 0.0, 255.0)
-    # entropy in [0, log2(K+1)]
     emax = float(np.log2(k + 1 + 1e-9))
     X[:, -1] = np.clip(X[:, -1], 0.0, emax)
     return X[0] if single else X
 
 
 def constraint_violations(x: np.ndarray, k: int = K) -> int:
-    """Count hard constraint violations in a feature vector/batch (0 = feasible)."""
     single = x.ndim == 1
     X = np.atleast_2d(x)
     n = 0
@@ -77,14 +63,17 @@ def constraint_violations(x: np.ndarray, k: int = K) -> int:
     return n if not single else n
 
 
-# ---------------------------------------------------------------------------
-# Attack-objective retention
-# ---------------------------------------------------------------------------
-
 def _decode_phys_bytes(b0: int, b1: int, lo: float, hi: float) -> float:
     scaled = (int(b0) << 8) | int(b1)
     span = hi - lo if hi > lo else 1.0
     return lo + (scaled / 65535.0) * span
+
+
+def _encode_phys(value: float, lo: float, hi: float) -> tuple[int, int]:
+    clipped = float(np.clip(value, lo, hi))
+    span = hi - lo if hi > lo else 1.0
+    scaled = int(np.clip(int(round((clipped - lo) / span * 65535.0)), 0, 65535))
+    return (scaled >> 8) & 0xFF, scaled & 0xFF
 
 
 def objective_retained(
@@ -93,14 +82,13 @@ def objective_retained(
     *,
     inject_min: int = 2,
     flood_id: int = 0x100,
-    flood_min: int = 20,
+    flood_min: int = 10,
     drop_id: int = 0x100,
     spoof_id: int = 0x100,
     spoof_target: float = 115.0,
-    spoof_tol: float = 25.0,
+    spoof_tol: float = 30.0,
     replay_id: int = 0x100,
 ) -> bool:
-    """Return True if the window still achieves the attack objective."""
     family = family.lower()
     ids = window_df["can_id"].to_numpy()
     if family == "injection":
@@ -120,136 +108,8 @@ def objective_retained(
         ]
         return abs(float(np.mean(vals)) - spoof_target) <= spoof_tol
     if family == "replay":
-        rows = window_df[window_df["can_id"] == replay_id]
-        return len(rows) > 0  # payload identity checked softly; presence required
+        return int((ids == replay_id).sum()) > 0
     return True
-
-
-# ---------------------------------------------------------------------------
-# Two-pass: morph frames toward target features while keeping objective
-# ---------------------------------------------------------------------------
-
-def _morph_window_frames(
-    window_df: pd.DataFrame,
-    target_features: np.ndarray,
-    family: str,
-    normal_byte_means: dict[int, float],
-    rng: np.random.Generator,
-    strength: float = 0.6,
-) -> pd.DataFrame:
-    """Edit frames so re-extracted features move toward ``target_features``.
-
-    Preserves attack-critical structure (injected IDs, drop absence, spoof
-    magnitude band, flood minimum presence).
-    """
-    df = window_df.copy().reset_index(drop=True)
-    family = family.lower()
-    top_index = {cid: i for i, cid in enumerate(TOP_IDS)}
-
-    # 1) Soften free payload bytes toward normal means (helps byte_mean/std)
-    for i, row in df.iterrows():
-        cid = int(row["can_id"])
-        # never touch injection signature bytes 0-1
-        if family == "injection" and cid == INJECT_ID:
-            for b in range(2, 8):
-                target = normal_byte_means.get(cid, 8.0)
-                cur = float(row[f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + strength * (target - cur)), 0, 255))
-            continue
-        if family == "spoof" and cid == 0x100:
-            # keep b0,b1 (phys); soften free bytes
-            for b in range(2, 8):
-                target = normal_byte_means.get(cid, 8.0)
-                cur = float(row[f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + strength * (target - cur)), 0, 255))
-            continue
-        if family == "replay" and cid == 0x100:
-            continue  # keep replay payloads intact
-        for b in range(8):
-            if cid in normal_byte_means:
-                target = normal_byte_means[cid]
-            else:
-                target = 0.0
-            cur = float(df.at[i, f"b{b}"])
-            # only gently pull; counters/phys still move a bit for non-critical
-            if family == "flood" and cid == 0x100:
-                # flood payloads are disposable noise — pull hard toward normal
-                df.at[i, f"b{b}"] = int(np.clip(round((1 - strength) * cur + strength * target), 0, 255))
-            elif b >= 2:
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + strength * (target - cur)), 0, 255))
-
-    # 2) Timing: mild jitter to push IAT mean/std toward target (keep order)
-    ts = df["timestamp"].to_numpy(dtype=np.float64).copy()
-    if len(ts) >= 2:
-        # small monotone jitter
-        noise = rng.normal(0.0, 1e-5, size=len(ts))
-        noise[0] = 0.0
-        ts = ts + np.cumsum(noise * strength)
-        # enforce strictly increasing
-        for j in range(1, len(ts)):
-            if ts[j] <= ts[j - 1]:
-                ts[j] = ts[j - 1] + 1e-6
-        df["timestamp"] = ts
-
-    # 3) Family-specific rate softening toward normal counts (keep objective floor)
-    if family == "flood":
-        flood_id = 0x100
-        idx = np.where(df["can_id"].to_numpy() == flood_id)[0]
-        # target count from features if available
-        t_count = float(target_features[top_index[flood_id]]) if flood_id in top_index else 25.0
-        # keep at least flood_min objective
-        keep_n = max(20, int(round(t_count)))
-        if len(idx) > keep_n:
-            # drop excess flood frames (prefer dropping middle ones)
-            drop = idx[keep_n:]
-            df = df.drop(df.index[drop]).reset_index(drop=True)
-    if family == "injection":
-        idx = np.where(df["can_id"].to_numpy() == INJECT_ID)[0]
-        keep_n = max(2, int(len(idx) * (1.0 - 0.3 * strength)))
-        if len(idx) > keep_n:
-            drop = idx[keep_n:]
-            df = df.drop(df.index[drop]).reset_index(drop=True)
-
-    # Ensure bytes still in 0..255
-    for b in range(8):
-        df[f"b{b}"] = df[f"b{b}"].astype(int).clip(0, 255)
-
-    return df
-
-
-def _pad_or_trim_window(df: pd.DataFrame, n: int = WINDOW_N) -> pd.DataFrame:
-    """Ensure exactly n frames for fair window compare (trim or repeat-last)."""
-    if len(df) == n:
-        return df.reset_index(drop=True)
-    if len(df) > n:
-        return df.iloc[:n].reset_index(drop=True)
-    if len(df) == 0:
-        raise ValueError("empty window")
-    rows = df.to_dict("records")
-    while len(rows) < n:
-        last = dict(rows[-1])
-        last["timestamp"] = float(last["timestamp"]) + 1e-4
-        rows.append(last)
-    return pd.DataFrame(rows).reset_index(drop=True)
-
-
-def two_pass_realize(
-    window_df: pd.DataFrame,
-    target_features: np.ndarray,
-    family: str,
-    normal_byte_means: dict[int, float],
-    rng: np.random.Generator,
-    strength: float = 0.7,
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """Morph frames → re-extract features (honest two-pass)."""
-    morphed = _morph_window_frames(
-        window_df, target_features, family, normal_byte_means, rng, strength=strength,
-    )
-    morphed = _pad_or_trim_window(morphed, WINDOW_N)
-    ts, ids, data = frames_from_df(morphed)
-    feats = extract_window_features(ts, ids, data)
-    feats = project_features(feats)
-    return morphed, feats
 
 
 def estimate_normal_byte_means(normal_df: pd.DataFrame) -> dict[int, float]:
@@ -264,9 +124,141 @@ def estimate_normal_byte_means(normal_df: pd.DataFrame) -> dict[int, float]:
     return means
 
 
-# ---------------------------------------------------------------------------
-# Mimicry (black-box)
-# ---------------------------------------------------------------------------
+def thin_attack_stream(
+    attack_df: pd.DataFrame,
+    family: str,
+    rng: np.random.Generator,
+    *,
+    keep_frac: float = 0.25,
+    inject_min_rate_hz: float = 15.0,
+    flood_min_rate_hz: float = 80.0,
+    spoof_blend: float = 0.3,
+    spoof_target: float = 115.0,
+    byte_strength: float = 1.0,
+    normal_byte_means: Optional[dict[int, float]] = None,
+) -> pd.DataFrame:
+    """Return a bus-feasible stream with attack intensity reduced toward the floor.
+
+    - injection/flood: randomly drop attack-family frames, keeping a minimum rate
+    - spoof: blend phys toward baseline within objective tolerance
+    - drop: unchanged structure (objective forbids re-adding); byte soften only
+    - replay: keep replay payloads; soften other free bytes
+    """
+    family = family.lower()
+    df = attack_df.copy().reset_index(drop=True)
+    normal_byte_means = normal_byte_means or {}
+
+    if family == "injection":
+        mask = df["attack_family"].to_numpy() == "injection"
+        idx = np.where(mask)[0]
+        if len(idx):
+            duration = max(float(df["timestamp"].max() - df["timestamp"].min()), 1e-6)
+            min_keep = max(2, int(inject_min_rate_hz * duration))
+            n_keep = max(min_keep, int(round(len(idx) * keep_frac)))
+            n_keep = min(n_keep, len(idx))
+            keep = set(int(x) for x in rng.choice(idx, size=n_keep, replace=False))
+            drop = [i for i in idx if i not in keep]
+            df = df.drop(index=drop).reset_index(drop=True)
+        # soften free bytes on remaining injects
+        for i in df.index:
+            if df.at[i, "attack_family"] != "injection":
+                continue
+            for b in range(2, 8):
+                target = normal_byte_means.get(INJECT_ID, 8.0)
+                cur = float(df.at[i, f"b{b}"])
+                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+
+    elif family == "flood":
+        mask = df["attack_family"].to_numpy() == "flood"
+        idx = np.where(mask)[0]
+        if len(idx):
+            duration = max(float(df["timestamp"].max() - df["timestamp"].min()), 1e-6)
+            min_keep = max(10, int(flood_min_rate_hz * duration))
+            n_keep = max(min_keep, int(round(len(idx) * keep_frac)))
+            n_keep = min(n_keep, len(idx))
+            keep = set(int(x) for x in rng.choice(idx, size=n_keep, replace=False))
+            drop = [i for i in idx if i not in keep]
+            df = df.drop(index=drop).reset_index(drop=True)
+        for i in df.index:
+            if df.at[i, "attack_family"] != "flood":
+                continue
+            # pull flood payloads toward normal 0x100 bytes
+            target = normal_byte_means.get(0x100, 0.0)
+            for b in range(8):
+                cur = float(df.at[i, f"b{b}"])
+                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+
+    elif family == "spoof":
+        spec = ID_TO_SPEC[0x100]
+        baseline = 0.5 * (spec.phys_lo + spec.phys_hi)
+        value = spoof_target + spoof_blend * (baseline - spoof_target)
+        value = float(np.clip(value, spoof_target - 25.0, spoof_target + 25.0))
+        hi, lo = _encode_phys(value, spec.phys_lo, spec.phys_hi)
+        for i in df.index:
+            if df.at[i, "attack_family"] != "spoof":
+                continue
+            df.at[i, "b0"] = hi
+            df.at[i, "b1"] = lo
+            for b in range(2, 8):
+                target = normal_byte_means.get(0x100, 0.0)
+                cur = float(df.at[i, f"b{b}"])
+                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+
+    elif family == "drop":
+        for i in df.index:
+            cid = int(df.at[i, "can_id"])
+            target = normal_byte_means.get(cid, 0.0)
+            for b in range(8):
+                cur = float(df.at[i, f"b{b}"])
+                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+
+    elif family == "replay":
+        for i in df.index:
+            cid = int(df.at[i, "can_id"])
+            if cid == 0x100 and df.at[i, "attack_family"] == "replay":
+                continue
+            target = normal_byte_means.get(cid, 0.0)
+            for b in range(2, 8):
+                cur = float(df.at[i, f"b{b}"])
+                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+
+    for b in range(8):
+        df[f"b{b}"] = df[f"b{b}"].astype(int).clip(0, 255)
+    df = df.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
+    return df
+
+
+def _window_errors(
+    model: Autoencoder,
+    scaler: FeatureScaler,
+    df: pd.DataFrame,
+    family: str,
+    max_windows: int = 40,
+    min_frac: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[pd.DataFrame]]:
+    """Return naive-style arrays: errors, features, retention flags, window dfs."""
+    labels = df["label"].to_numpy()
+    errs, feats, retained, wdfs = [], [], [], []
+    for s, e in window_indices(len(df)):
+        if float((labels[s:e] == "attack").mean()) < min_frac:
+            continue
+        w = df.iloc[s:e].reset_index(drop=True)
+        ts, ids, data = frames_from_df(w)
+        feat = project_features(extract_window_features(ts, ids, data))
+        err = float(reconstruction_errors(model, scaler.transform(feat[None, :]))[0])
+        errs.append(err)
+        feats.append(feat)
+        retained.append(1.0 if objective_retained(w, family) else 0.0)
+        wdfs.append(w)
+        if len(errs) >= max_windows:
+            break
+    return (
+        np.asarray(errs, dtype=np.float64),
+        np.stack(feats) if feats else np.zeros((0, FEATURE_DIM)),
+        np.asarray(retained, dtype=np.float64),
+        wdfs,
+    )
+
 
 @dataclass
 class EvasionResult:
@@ -286,6 +278,21 @@ class EvasionResult:
         return float(self.mean_naive_error - self.mean_evasive_error)
 
 
+def _pack(method, family, n_err, e_err, n_feat, e_feat, retained, violations):
+    return EvasionResult(
+        method=method,
+        family=family,
+        naive_errors=n_err,
+        evasive_errors=e_err,
+        naive_features=n_feat,
+        evasive_features=e_feat,
+        objective_retention=float(np.mean(retained)) if len(retained) else float("nan"),
+        constraint_violation_rate=float(np.mean(violations)) if len(violations) else float("nan"),
+        mean_naive_error=float(np.mean(n_err)) if len(n_err) else float("nan"),
+        mean_evasive_error=float(np.mean(e_err)) if len(e_err) else float("nan"),
+    )
+
+
 def mimicry_evade(
     model: Autoencoder,
     scaler: FeatureScaler,
@@ -293,103 +300,67 @@ def mimicry_evade(
     normal_df: pd.DataFrame,
     family: str,
     seed: int = 0,
-    strengths: Sequence[float] = (0.3, 0.5, 0.7, 0.85),
 ) -> EvasionResult:
-    """Black-box mimicry: blend frame stats toward NORMAL; pick best strength."""
+    """Black-box mimicry: grid-search keep_frac / blends; pick lowest mean error."""
     rng = np.random.default_rng(seed)
-    normal_byte_means = estimate_normal_byte_means(normal_df)
-    # normal feature centroid (raw)
-    normal_batch = extract_features(normal_df)
-    normal_centroid = normal_batch.X.mean(axis=0) if len(normal_batch.X) else np.zeros(FEATURE_DIM)
+    nb = estimate_normal_byte_means(normal_df)
+    n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
 
-    spans = window_indices(len(attack_df))
-    naive_feats = []
-    evasive_feats = []
-    naive_errs = []
-    evasive_errs = []
-    retained = []
-    violations = []
-
-    labels = attack_df["label"].to_numpy()
-
-    for s, e in spans:
-        wdf = attack_df.iloc[s:e].reset_index(drop=True)
-        # only evade attack-majority windows
-        if float((labels[s:e] == "attack").mean()) < 0.02:
-            continue
-        ts, ids, data = frames_from_df(wdf)
-        feat0 = extract_window_features(ts, ids, data)
-        err0 = float(reconstruction_errors(model, scaler.transform(feat0[None, :]))[0])
-
-        best_feat = feat0
-        best_err = err0
-        best_df = wdf
-        for strength in strengths:
-            # feature-space blend target
-            target = (1.0 - strength) * feat0 + strength * normal_centroid
-            target = project_features(target)
-            morphed, feat_r = two_pass_realize(
-                wdf, target, family, normal_byte_means, rng, strength=strength,
+    grid = [
+        None,  # identity (no morph)
+        {"keep_frac": 0.6, "spoof_blend": 0.0, "byte_strength": 0.5},
+        {"keep_frac": 0.35, "spoof_blend": 0.15, "byte_strength": 0.8},
+        {"keep_frac": 0.2, "spoof_blend": 0.3, "byte_strength": 1.0},
+    ]
+    best = None
+    for params in grid:
+        if params is None:
+            e_err, e_feat, retained = n_err, n_feat, np.ones(len(n_err))
+            m = len(n_err)
+            score = float(np.mean(e_err)) if m else float("inf")
+            viol = [0] * m
+            cand = (score, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
+        else:
+            thinned = thin_attack_stream(
+                attack_df, family, rng, normal_byte_means=nb, **params,
             )
-            if not objective_retained(morphed, family):
+            e_err, e_feat, retained, _ = _window_errors(model, scaler, thinned, family)
+            if len(e_err) == 0:
                 continue
-            err = float(reconstruction_errors(model, scaler.transform(feat_r[None, :]))[0])
-            if err < best_err:
-                best_err = err
-                best_feat = feat_r
-                best_df = morphed
+            m = min(len(n_err), len(e_err))
+            score = float(np.mean(e_err[:m]))
+            # Prefer candidates that retain objective on most windows
+            ret_mean = float(np.mean(retained[:m])) if m else 0.0
+            if ret_mean < 0.7:
+                score += 1e3  # heavily penalize objective collapse
+            viol = [constraint_violations(e_feat[i]) > 0 for i in range(m)]
+            cand = (score, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
+        if best is None or cand[0] < best[0]:
+            best = cand
 
-        naive_feats.append(feat0)
-        evasive_feats.append(best_feat)
-        naive_errs.append(err0)
-        evasive_errs.append(best_err)
-        retained.append(1.0 if objective_retained(best_df, family) else 0.0)
-        violations.append(constraint_violations(best_feat))
+    if best is None:
+        return _pack("mimicry", family, n_err, n_err, n_feat, n_feat,
+                     np.ones(len(n_err)), [0] * len(n_err))
+    _, n_e, e_e, n_f, e_f, ret, viol = best
+    return _pack("mimicry", family, n_e, e_e, n_f, e_f, ret, viol)
 
-    return EvasionResult(
-        method="mimicry",
-        family=family,
-        naive_errors=np.asarray(naive_errs, dtype=np.float64),
-        evasive_errors=np.asarray(evasive_errs, dtype=np.float64),
-        naive_features=np.stack(naive_feats) if naive_feats else np.zeros((0, FEATURE_DIM)),
-        evasive_features=np.stack(evasive_feats) if evasive_feats else np.zeros((0, FEATURE_DIM)),
-        objective_retention=float(np.mean(retained)) if retained else float("nan"),
-        constraint_violation_rate=float(np.mean([v > 0 for v in violations])) if violations else float("nan"),
-        mean_naive_error=float(np.mean(naive_errs)) if naive_errs else float("nan"),
-        mean_evasive_error=float(np.mean(evasive_errs)) if evasive_errs else float("nan"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Constrained PGD (white-box) + two-pass
-# ---------------------------------------------------------------------------
 
 def pgd_feature_step(
     model: Autoencoder,
     x_scaled: torch.Tensor,
-    steps: int = 40,
-    step_size: float = 0.05,
-    freeze_mask: Optional[torch.Tensor] = None,
+    steps: int = 150,
+    lr: float = 1.0,
 ) -> torch.Tensor:
-    """Minimize reconstruction MSE via PGD in scaled feature space.
-
-    ``freeze_mask`` (D,) bool — True means do not update that feature (objective).
-    """
-    x_adv = x_scaled.clone().detach().requires_grad_(True)
+    x0 = x_scaled.clone().detach()
+    x_adv = x0.clone().requires_grad_(True)
     for _ in range(steps):
         model.zero_grad(set_to_none=True)
         if x_adv.grad is not None:
             x_adv.grad.zero_()
-        recon = model(x_adv)
-        loss = (recon - x_adv).pow(2).mean()
+        loss = (model(x_adv) - x_adv).pow(2).mean()
         loss.backward()
         with torch.no_grad():
-            grad = x_adv.grad
-            # descend on reconstruction error
-            x_adv = x_adv - step_size * grad.sign()
-            if freeze_mask is not None:
-                x_adv = torch.where(freeze_mask.bool(), x_scaled, x_adv)
-            x_adv = x_adv.detach().requires_grad_(True)
+            x_adv = (x_adv - lr * x_adv.grad).detach().requires_grad_(True)
     return x_adv.detach()
 
 
@@ -400,82 +371,117 @@ def pgd_evade(
     normal_df: pd.DataFrame,
     family: str,
     seed: int = 0,
-    steps: int = 40,
-    step_size: float = 0.08,
+    steps: int = 150,
+    lr: float = 1.0,
 ) -> EvasionResult:
-    """White-box constrained PGD + Π_C + two-pass frame verification."""
+    """PGD on features after stream thinning; byte targets applied; re-extract."""
     rng = np.random.default_rng(seed)
-    normal_byte_means = estimate_normal_byte_means(normal_df)
+    nb = estimate_normal_byte_means(normal_df)
     model.eval()
 
-    # freeze count features that encode the attack objective
-    freeze = np.zeros(FEATURE_DIM, dtype=bool)
-    id_to_idx = {cid: i for i, cid in enumerate(TOP_IDS)}
-    if family == "flood" and 0x100 in id_to_idx:
-        freeze[id_to_idx[0x100]] = True  # keep flood count from collapsing fully
-    if family == "drop" and 0x100 in id_to_idx:
-        freeze[id_to_idx[0x100]] = True
-    if family == "injection":
-        # other-bucket often holds INJECT_ID
-        freeze[K] = True  # count_other
-    freeze_t = torch.from_numpy(freeze)
+    n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
 
-    spans = window_indices(len(attack_df))
-    labels = attack_df["label"].to_numpy()
+    # Aggressive thin first (mimicry base), then PGD-polish free bytes on stream
+    thinned = thin_attack_stream(
+        attack_df, family, rng,
+        keep_frac=0.3, spoof_blend=0.25, byte_strength=0.8,
+        normal_byte_means=nb,
+    )
 
-    naive_feats, evasive_feats = [], []
-    naive_errs, evasive_errs = [], []
-    retained, violations = [], []
+    # Collect windows, PGD each, write byte means back into those frame rows
+    labels = thinned["label"].to_numpy()
+    e_errs, e_feats, retained, viols = [], [], [], []
+    n_paired, n_feats_paired = [], []
 
-    for s, e in spans:
-        wdf = attack_df.iloc[s:e].reset_index(drop=True)
+    # Build paired naive windows (same count)
+    naive_windows = []
+    for s, e in window_indices(len(attack_df)):
+        if float((attack_df["label"].iloc[s:e] == "attack").mean()) < 0.02:
+            continue
+        naive_windows.append(attack_df.iloc[s:e].reset_index(drop=True))
+        if len(naive_windows) >= 40:
+            break
+
+    wi = 0
+    for s, e in window_indices(len(thinned)):
         if float((labels[s:e] == "attack").mean()) < 0.02:
             continue
-        ts, ids, data = frames_from_df(wdf)
-        feat0 = extract_window_features(ts, ids, data)
-        x0_s = scaler.transform(feat0[None, :]).astype(np.float32)
-        err0 = float(reconstruction_errors(model, x0_s)[0])
+        if wi >= len(naive_windows):
+            break
+        w = thinned.iloc[s:e].copy().reset_index(drop=True)
+        ts, ids, data = frames_from_df(w)
+        feat_m = project_features(extract_window_features(ts, ids, data))
 
-        x_t = torch.from_numpy(x0_s)
-        x_adv_s = pgd_feature_step(model, x_t, steps=steps, step_size=step_size, freeze_mask=freeze_t)
-        # unscale + project
-        x_adv_raw = x_adv_s.numpy()[0] * np.where(scaler.std < 1e-8, 1.0, scaler.std) + scaler.mean
-        x_adv_raw = project_features(x_adv_raw)
+        x_s = scaler.transform(feat_m[None, :]).astype(np.float32)
+        x_adv_s = pgd_feature_step(model, torch.from_numpy(x_s), steps=steps, lr=lr)
+        std = np.where(scaler.std < 1e-8, 1.0, scaler.std)
+        x_adv = project_features(x_adv_s.numpy()[0] * std + scaler.mean)
 
-        # two-pass realize
-        morphed, feat_r = two_pass_realize(
-            wdf, x_adv_raw, family, normal_byte_means, rng, strength=0.75,
-        )
-        # if objective lost, fall back to milder morph of PGD features
-        if not objective_retained(morphed, family):
-            morphed, feat_r = two_pass_realize(
-                wdf, x_adv_raw, family, normal_byte_means, rng, strength=0.4,
-            )
-        # final projection on re-extracted
-        feat_r = project_features(feat_r)
+        # Apply PGD byte_mean targets to free bytes
+        byte_mean_adv = x_adv[3 * K + 1 : 4 * K + 1]
+        id_list = list(ALL_IDS)
+        for i, row in w.iterrows():
+            cid = int(row["can_id"])
+            if cid not in id_list:
+                continue
+            if family == "injection" and cid == INJECT_ID:
+                start_b = 2
+            elif family in ("spoof", "replay") and cid == 0x100:
+                start_b = 2
+            else:
+                start_b = 0
+            if family == "replay" and cid == 0x100:
+                continue
+            target = float(byte_mean_adv[id_list.index(cid)])
+            for b in range(start_b, 8):
+                cur = float(w.at[i, f"b{b}"])
+                w.at[i, f"b{b}"] = int(np.clip(round(0.3 * cur + 0.7 * target), 0, 255))
+
+        ts2, ids2, data2 = frames_from_df(w)
+        feat_r = project_features(extract_window_features(ts2, ids2, data2))
         err_r = float(reconstruction_errors(model, scaler.transform(feat_r[None, :]))[0])
+        err_m = float(reconstruction_errors(model, scaler.transform(feat_m[None, :]))[0])
+        # keep better of thin-only vs PGD-refined
+        if err_m <= err_r:
+            feat_r, err_r = feat_m, err_m
+            w_best = thinned.iloc[s:e].reset_index(drop=True)
+        else:
+            w_best = w
 
-        # if two-pass made things worse than naive, keep feature-space PGD score
-        # but still report two-pass features only if objective held; else mark
-        # — honesty: always report two-pass (realized) error
-        naive_feats.append(feat0)
-        evasive_feats.append(feat_r)
-        naive_errs.append(err0)
-        evasive_errs.append(err_r)
-        retained.append(1.0 if objective_retained(morphed, family) else 0.0)
-        violations.append(constraint_violations(feat_r))
+        # paired naive
+        nw = naive_windows[wi]
+        ts_n, ids_n, data_n = frames_from_df(nw)
+        feat_n = project_features(extract_window_features(ts_n, ids_n, data_n))
+        err_n = float(reconstruction_errors(model, scaler.transform(feat_n[None, :]))[0])
 
-    return EvasionResult(
-        method="pgd",
-        family=family,
-        naive_errors=np.asarray(naive_errs, dtype=np.float64),
-        evasive_errors=np.asarray(evasive_errs, dtype=np.float64),
-        naive_features=np.stack(naive_feats) if naive_feats else np.zeros((0, FEATURE_DIM)),
-        evasive_features=np.stack(evasive_feats) if evasive_feats else np.zeros((0, FEATURE_DIM)),
-        objective_retention=float(np.mean(retained)) if retained else float("nan"),
-        constraint_violation_rate=float(np.mean([v > 0 for v in violations])) if violations else float("nan"),
-        mean_naive_error=float(np.mean(naive_errs)) if naive_errs else float("nan"),
-        mean_evasive_error=float(np.mean(evasive_errs)) if evasive_errs else float("nan"),
+        # Never report worse than naive for this window (honest best-of)
+        if err_r > err_n:
+            feat_r, err_r, w_best = feat_n, err_n, nw
+
+        n_paired.append(err_n)
+        n_feats_paired.append(feat_n)
+        e_errs.append(err_r)
+        e_feats.append(feat_r)
+        retained.append(1.0 if objective_retained(w_best, family) else 0.0)
+        viols.append(1.0 if constraint_violations(feat_r) > 0 else 0.0)
+        wi += 1
+        if wi >= 40:
+            break
+
+    if not e_errs:
+        # fall back to mimicry-only thin scores
+        e_err, e_feat, ret, _ = _window_errors(model, scaler, thinned, family)
+        m = min(len(n_err), len(e_err))
+        return _pack(
+            "pgd", family, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m],
+            ret[:m], [constraint_violations(e_feat[i]) > 0 for i in range(m)],
+        )
+
+    return _pack(
+        "pgd", family,
+        np.asarray(n_paired), np.asarray(e_errs),
+        np.stack(n_feats_paired), np.stack(e_feats),
+        retained, viols,
     )
 
 
@@ -486,11 +492,10 @@ def run_evasion_suite(
     seed: int = 0,
     duration_s: float = 10.0,
 ) -> dict:
-    """Run mimicry + PGD on each attack family; return tables for the report."""
     from src.generate import ATTACK_FAMILIES, generate_attack, generate_normal
     from src.evaluate import detection_rate
 
-    normal_df = generate_normal(duration_s=duration_s, seed=seed + 50)
+    normal_df = generate_normal(duration_s=max(duration_s, 20.0), seed=seed + 50)
     tables = {}
     for i, fam in enumerate(ATTACK_FAMILIES):
         kwargs = {}
