@@ -18,6 +18,12 @@
 
 ## Headlines (read these first)
 
+### (0) Key finding — structure over payload
+
+> **Key finding:** The autoencoder's decisions are driven by message structure (rates, timing, ID mix), not payload content. Consequences: payload-only attacks (spoof, replay) are invisible to it; white-box PGD on payload bytes lowers reconstruction error in 99% of windows but can't cross τ; only rate-shaping mimicry evades, cutting injection detection from 100% to 84% on average (seed 2: no reduction). Flood/drop dominate the structural features and can't be evaded while keeping their objective.
+
+Numbers from `results/aggregate.json` (unchanged metrics): injection mean recon naive **1.52** / mimicry **0.79** / PGD **1.38** vs τ≈**0.53**; injection PGD `frac_improved` **0.99**; spoof/replay naive recon ≈**0.23** (< τ). Gate status below remains **GATES_PASS=False** (all-seed inj FAIL; FPR PASS).
+
 ### (a) Injection mimicry @ τ (primary = held-out NORMAL p99)
 
 - Gate headline_ok: **False** (naive≥20%/seed, mean Δ≥10pp, Δ>0 all seeds)

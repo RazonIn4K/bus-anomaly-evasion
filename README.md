@@ -8,6 +8,10 @@ attack-objective constraint. A detector trained only on "normal" traffic flags
 what it can't reconstruct; a shaped attack that sits on the normal manifold slips
 under the threshold.
 
+> **Key finding:** The autoencoder's decisions are driven by message structure (rates, timing, ID mix), not payload content. Consequences: payload-only attacks (spoof, replay) are invisible to it; white-box PGD on payload bytes lowers reconstruction error in 99% of windows but can't cross τ; only rate-shaping mimicry evades, cutting injection detection from 100% to 84% on average (seed 2: no reduction). Flood/drop dominate the structural features and can't be evaded while keeping their objective.
+
+Supporting recon @τ≈0.53 (`results/aggregate.json`): injection mean recon naive **1.52** / mimicry **0.79** / PGD **1.38**; PGD `frac_improved` **0.99**; spoof/replay naive recon ≈**0.23** (< τ).
+
 > **Synthetic only.** Portfolio research artifact. Not a real vehicle bus, not a
 > production IDS, no HIL claims.
 
