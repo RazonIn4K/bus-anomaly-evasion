@@ -6,7 +6,9 @@
     reconstruction MSE, Π_C projection, then map byte-stat targets back onto
     the thinned stream and re-extract (two-pass verify).
 
-Evasion must beat naive recon error and stay bus-feasible.
+Evasion should reduce recon error vs naive when the morph works, stay
+bus-feasible, and report honest path attribution (thin vs true PGD) with no
+never-worse-than-naive clamp.
 """
 
 from __future__ import annotations
@@ -260,6 +262,11 @@ def _window_errors(
     )
 
 
+PATH_THIN = "thin"
+PATH_TRUE_PGD = "true_pgd"
+PATH_NAIVE_FALLBACK = "naive_fallback"
+
+
 @dataclass
 class EvasionResult:
     method: str
@@ -272,13 +279,55 @@ class EvasionResult:
     constraint_violation_rate: float
     mean_naive_error: float
     mean_evasive_error: float
+    retained_mask: np.ndarray
+    path_labels: np.ndarray
+    frac_improved: float
+    frac_fallback: float
+    path_counts: dict
 
     @property
     def error_reduction(self) -> float:
         return float(self.mean_naive_error - self.mean_evasive_error)
 
 
-def _pack(method, family, n_err, e_err, n_feat, e_feat, retained, violations):
+def _path_counts(labels: np.ndarray) -> dict:
+    counts = {PATH_THIN: 0, PATH_TRUE_PGD: 0, PATH_NAIVE_FALLBACK: 0}
+    for lab in labels:
+        key = str(lab)
+        if key in counts:
+            counts[key] += 1
+    return counts
+
+
+def _pack(
+    method,
+    family,
+    n_err,
+    e_err,
+    n_feat,
+    e_feat,
+    retained,
+    violations,
+    path_labels=None,
+):
+    n_err = np.asarray(n_err, dtype=np.float64)
+    e_err = np.asarray(e_err, dtype=np.float64)
+    retained_arr = np.asarray(retained, dtype=np.float64)
+    if path_labels is None:
+        # Mimicry is stream-thinning / blend; label every window as thin.
+        path_labels = np.full(len(e_err), PATH_THIN if method == "mimicry" else PATH_TRUE_PGD, dtype=object)
+    else:
+        path_labels = np.asarray(path_labels, dtype=object)
+    m = len(e_err)
+    if m and len(n_err) == m:
+        improved = e_err < n_err
+        # frac_fallback: windows that did not beat naive recon (honest, no clamp)
+        fallback = e_err >= n_err
+        frac_improved = float(improved.mean())
+        frac_fallback = float(fallback.mean())
+    else:
+        frac_improved = float("nan")
+        frac_fallback = float("nan")
     return EvasionResult(
         method=method,
         family=family,
@@ -286,11 +335,36 @@ def _pack(method, family, n_err, e_err, n_feat, e_feat, retained, violations):
         evasive_errors=e_err,
         naive_features=n_feat,
         evasive_features=e_feat,
-        objective_retention=float(np.mean(retained)) if len(retained) else float("nan"),
+        objective_retention=float(np.mean(retained_arr)) if len(retained_arr) else float("nan"),
         constraint_violation_rate=float(np.mean(violations)) if len(violations) else float("nan"),
         mean_naive_error=float(np.mean(n_err)) if len(n_err) else float("nan"),
         mean_evasive_error=float(np.mean(e_err)) if len(e_err) else float("nan"),
+        retained_mask=retained_arr.astype(bool) if len(retained_arr) else np.zeros(0, dtype=bool),
+        path_labels=path_labels,
+        frac_improved=frac_improved,
+        frac_fallback=frac_fallback,
+        path_counts=_path_counts(path_labels),
     )
+
+
+def gated_detection_rate(
+    errors: np.ndarray,
+    tau: float,
+    retained_mask: np.ndarray,
+    path_labels: Optional[np.ndarray] = None,
+    require_path: Optional[str] = None,
+) -> float:
+    """TPR on windows that retain the attack objective (and optional path filter)."""
+    if len(errors) == 0:
+        return float("nan")
+    mask = np.asarray(retained_mask, dtype=bool)
+    if require_path is not None:
+        if path_labels is None:
+            return float("nan")
+        mask = mask & (np.asarray(path_labels, dtype=object) == require_path)
+    if mask.sum() == 0:
+        return float("nan")
+    return float((errors[mask] > tau).mean())
 
 
 def mimicry_evade(
@@ -374,7 +448,14 @@ def pgd_evade(
     steps: int = 150,
     lr: float = 1.0,
 ) -> EvasionResult:
-    """PGD on features after stream thinning; byte targets applied; re-extract."""
+    """PGD on features after stream thinning; byte targets applied; re-extract.
+
+    Path labels (per window):
+      - true_pgd: gradient + two-pass refine was used (only these count as PGD)
+      - thin: rate-thinning / blend only (PGD refine did not beat thin)
+      - naive_fallback: no usable evasive morph; raw naive window kept
+    Actual recon MSE is reported even when worse than naive (no clamp).
+    """
     rng = np.random.default_rng(seed)
     nb = estimate_normal_byte_means(normal_df)
     model.eval()
@@ -388,12 +469,10 @@ def pgd_evade(
         normal_byte_means=nb,
     )
 
-    # Collect windows, PGD each, write byte means back into those frame rows
     labels = thinned["label"].to_numpy()
-    e_errs, e_feats, retained, viols = [], [], [], []
+    e_errs, e_feats, retained, viols, paths = [], [], [], [], []
     n_paired, n_feats_paired = [], []
 
-    # Build paired naive windows (same count)
     naive_windows = []
     for s, e in window_indices(len(attack_df)):
         if float((attack_df["label"].iloc[s:e] == "attack").mean()) < 0.02:
@@ -438,25 +517,25 @@ def pgd_evade(
                 w.at[i, f"b{b}"] = int(np.clip(round(0.3 * cur + 0.7 * target), 0, 255))
 
         ts2, ids2, data2 = frames_from_df(w)
-        feat_r = project_features(extract_window_features(ts2, ids2, data2))
-        err_r = float(reconstruction_errors(model, scaler.transform(feat_r[None, :]))[0])
-        err_m = float(reconstruction_errors(model, scaler.transform(feat_m[None, :]))[0])
-        # keep better of thin-only vs PGD-refined
-        if err_m <= err_r:
-            feat_r, err_r = feat_m, err_m
-            w_best = thinned.iloc[s:e].reset_index(drop=True)
-        else:
-            w_best = w
+        feat_pgd = project_features(extract_window_features(ts2, ids2, data2))
+        err_pgd = float(reconstruction_errors(model, scaler.transform(feat_pgd[None, :]))[0])
+        err_thin = float(reconstruction_errors(model, scaler.transform(feat_m[None, :]))[0])
 
-        # paired naive
+        # paired naive (report actual errors — no never-worse clamp)
         nw = naive_windows[wi]
         ts_n, ids_n, data_n = frames_from_df(nw)
         feat_n = project_features(extract_window_features(ts_n, ids_n, data_n))
         err_n = float(reconstruction_errors(model, scaler.transform(feat_n[None, :]))[0])
 
-        # Never report worse than naive for this window (honest best-of)
-        if err_r > err_n:
-            feat_r, err_r, w_best = feat_n, err_n, nw
+        # Prefer true PGD when it beats thin; otherwise keep thin (labeled honestly).
+        # Do NOT clamp to naive — report actual recon MSE.
+        if err_pgd < err_thin - 1e-12:
+            feat_r, err_r, w_best = feat_pgd, err_pgd, w
+            path = PATH_TRUE_PGD
+        else:
+            feat_r, err_r = feat_m, err_thin
+            w_best = thinned.iloc[s:e].reset_index(drop=True)
+            path = PATH_THIN
 
         n_paired.append(err_n)
         n_feats_paired.append(feat_n)
@@ -464,17 +543,20 @@ def pgd_evade(
         e_feats.append(feat_r)
         retained.append(1.0 if objective_retained(w_best, family) else 0.0)
         viols.append(1.0 if constraint_violations(feat_r) > 0 else 0.0)
+        paths.append(path)
         wi += 1
         if wi >= 40:
             break
 
     if not e_errs:
-        # fall back to mimicry-only thin scores
+        # No windows: fall back to thin-only scores, labeled as thin (not PGD).
         e_err, e_feat, ret, _ = _window_errors(model, scaler, thinned, family)
         m = min(len(n_err), len(e_err))
+        path_labels = np.full(m, PATH_THIN, dtype=object)
         return _pack(
             "pgd", family, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m],
             ret[:m], [constraint_violations(e_feat[i]) > 0 for i in range(m)],
+            path_labels=path_labels,
         )
 
     return _pack(
@@ -482,6 +564,7 @@ def pgd_evade(
         np.asarray(n_paired), np.asarray(e_errs),
         np.stack(n_feats_paired), np.stack(e_feats),
         retained, viols,
+        path_labels=np.asarray(paths, dtype=object),
     )
 
 
@@ -504,19 +587,70 @@ def run_evasion_suite(
         atk = generate_attack(fam, duration_s=duration_s, seed=seed + 20 + i, **kwargs)
         mim = mimicry_evade(model, scaler, atk, normal_df, fam, seed=seed + 100 + i)
         pgd = pgd_evade(model, scaler, atk, normal_df, fam, seed=seed + 200 + i)
-        tpr_naive = detection_rate(mim.naive_errors, tau)
-        tpr_mim = detection_rate(mim.evasive_errors, tau)
-        tpr_pgd = detection_rate(pgd.evasive_errors, tau)
+
+        # Ungated (secondary): all windows
+        tpr_naive_ungated = detection_rate(mim.naive_errors, tau)
+        tpr_mim_ungated = detection_rate(mim.evasive_errors, tau)
+        tpr_pgd_ungated = detection_rate(pgd.evasive_errors, tau)
+
+        # Primary: objective-retained gate (spirit of mimicry >=0.7 retention).
+        # PGD primary further requires path == true_pgd so thinning is not credited.
+        tpr_naive = gated_detection_rate(mim.naive_errors, tau, mim.retained_mask)
+        # Naive matched to PGD true_pgd ∩ retained windows for fair ΔTPR
+        tpr_naive_pgd_gate = gated_detection_rate(
+            pgd.naive_errors, tau, pgd.retained_mask,
+            path_labels=pgd.path_labels, require_path=PATH_TRUE_PGD,
+        )
+        tpr_mim = gated_detection_rate(mim.evasive_errors, tau, mim.retained_mask)
+        tpr_pgd = gated_detection_rate(
+            pgd.evasive_errors, tau, pgd.retained_mask,
+            path_labels=pgd.path_labels, require_path=PATH_TRUE_PGD,
+        )
+
+        # Mean recon on true_pgd windows only (PGD headline honesty)
+        pgd_mask = (pgd.path_labels == PATH_TRUE_PGD) if len(pgd.path_labels) else np.zeros(0, dtype=bool)
+        if pgd_mask.any():
+            mean_recon_pgd_true = float(np.mean(pgd.evasive_errors[pgd_mask]))
+            mean_recon_naive_pgd_matched = float(np.mean(pgd.naive_errors[pgd_mask]))
+        else:
+            mean_recon_pgd_true = float("nan")
+            mean_recon_naive_pgd_matched = float("nan")
+
+        def _delta(a, b):
+            if a != a or b != b:
+                return float("nan")
+            return float(a - b)
+
         tables[fam] = {
             "n_windows": int(len(mim.naive_errors)),
+            "n_windows_pgd": int(len(pgd.naive_errors)),
+            "n_true_pgd": int(pgd.path_counts.get(PATH_TRUE_PGD, 0)),
+            "n_thin": int(pgd.path_counts.get(PATH_THIN, 0)),
+            "n_naive_fallback": int(pgd.path_counts.get(PATH_NAIVE_FALLBACK, 0)),
+            "path_counts_pgd": dict(pgd.path_counts),
             "mean_recon_naive": mim.mean_naive_error,
             "mean_recon_mimicry": mim.mean_evasive_error,
-            "mean_recon_pgd": pgd.mean_evasive_error,
-            "tpr_naive": tpr_naive,
+            # Headline PGD recon: true_pgd path only (nan if none)
+            "mean_recon_pgd": mean_recon_pgd_true,
+            "mean_recon_pgd_all_paths": pgd.mean_evasive_error,
+            "mean_recon_naive_pgd_matched": mean_recon_naive_pgd_matched,
+            "frac_improved_mimicry": mim.frac_improved,
+            "frac_fallback_mimicry": mim.frac_fallback,
+            "frac_improved_pgd": pgd.frac_improved,
+            "frac_fallback_pgd": pgd.frac_fallback,
+            # Primary (objective-gated; PGD also path-gated)
+            "tpr_naive": tpr_naive if tpr_naive == tpr_naive else tpr_naive_ungated,
+            "tpr_naive_pgd_matched": tpr_naive_pgd_gate,
             "tpr_mimicry": tpr_mim,
             "tpr_pgd": tpr_pgd,
-            "delta_tpr_mimicry": float(tpr_naive - tpr_mim) if tpr_naive == tpr_naive else float("nan"),
-            "delta_tpr_pgd": float(tpr_naive - tpr_pgd) if tpr_naive == tpr_naive else float("nan"),
+            "delta_tpr_mimicry": _delta(tpr_naive if tpr_naive == tpr_naive else tpr_naive_ungated, tpr_mim),
+            "delta_tpr_pgd": _delta(tpr_naive_pgd_gate, tpr_pgd),
+            # Secondary ungated
+            "tpr_naive_ungated": tpr_naive_ungated,
+            "tpr_mimicry_ungated": tpr_mim_ungated,
+            "tpr_pgd_ungated": tpr_pgd_ungated,
+            "delta_tpr_mimicry_ungated": _delta(tpr_naive_ungated, tpr_mim_ungated),
+            "delta_tpr_pgd_ungated": _delta(tpr_naive_ungated, tpr_pgd_ungated),
             "obj_retention_mimicry": mim.objective_retention,
             "obj_retention_pgd": pgd.objective_retention,
             "constraint_viol_mimicry": mim.constraint_violation_rate,
