@@ -71,8 +71,9 @@ n_true_pgd is mean windows / seed labeled frame-space PGD.
 
 ## Honest gaps
 
-- Macro ΔTPR across families hides the injection mimicry win and the
-  flood/drop non-evasion — read the headlines and per-family table.
+- Macro ΔTPR across families hides the partial, seed-dependent injection
+  mimicry reduction and the flood/drop non-evasion — read the headlines and
+  per-family table.
 - Fresh-normal FPR std target is < 1% after enlarging val / fresh streams;
   residual deviation is reported above, not clamped.
 - Synthetic only: no real captures, no HIL, no production claims.
