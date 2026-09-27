@@ -503,7 +503,8 @@ def _free_byte_mask(window_df: pd.DataFrame, family: str) -> np.ndarray:
     Objective-critical bytes stay fixed (spoof phys b0/b1; full replay payload
     on the replayed ID). On-bus adversary may also morph free mid-bytes of
     in-TOP_IDS background frames in the window so gradients reach byte_mean/std
-    (inject ID 0x7FF is outside TOP_IDS and does not enter those features).
+    (INJECT_ID 0x7FF is intentionally outside TOP_IDS / feature byte stats;
+    free background TOP_IDS mid-bytes provide the differentiable lever).
     """
     family = family.lower()
     n = len(window_df)

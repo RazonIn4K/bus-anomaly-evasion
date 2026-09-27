@@ -137,44 +137,85 @@ def calibrate_threshold(errors: np.ndarray, percentile: float = 99.0) -> float:
     return float(np.percentile(errors, percentile))
 
 
+def _block_seeds(seed: int, n_blocks: int = 12) -> list[int]:
+    """Deterministic NORMAL block seeds, disjoint from attack/fresh offsets.
+
+    Avoids collisions with generate_attack internal ``seed+1000`` backgrounds,
+    pipeline fresh ``seed+777``, and mimicry select/score offsets.
+    """
+    return [10_000 + seed * 100 + i for i in range(n_blocks)]
+
+
 def run_training_pipeline(
     seed: int = 0,
-    duration_s: float = 360.0,
+    duration_s: float = 200.0,
     out_dir: str | Path = "results",
-    epochs: int = 80,
-    val_frac: float = 0.25,
+    epochs: int = 60,
+    n_blocks: int = 12,
+    block_duration_s: float = 200.0,
+    n_train_blocks: int = 6,
+    n_earlystop_blocks: int = 1,
+    n_calib_blocks: int = 3,
+    n_test_blocks: int = 2,
 ) -> dict:
-    """End-to-end: generate NORMAL → features → train → τ=p99(val) → save.
+    """End-to-end: independent NORMAL blocks → train → τ=p99(calib) → save.
 
-    Uses a long SAME-stream temporal split so train/val/test share the NORMAL
-    manifold (avoids over-large dedicated-val τ that kills subtle injection
-    detection). ``duration_s`` and ``val_frac`` are sized so n_val is large
-    enough for fresh-normal FPR std < 1% across seeds.
+    Ordered temporal split of **independent** ``generate_normal`` blocks (each
+    reset+walk like fresh eval), not one uninterrupted mega-stream. This matches
+    the fresh-NORMAL distribution that FPR is measured on, avoiding mid-stream
+    vs reset mismatch while keeping τ = p99 of held-out NORMAL only.
+
+    Block roles (chronological, predetermined — never chosen by scores):
+      train (scaler+AE) | early-stop | calibration (τ) | NORMAL test (FPR check)
+    Features are extracted **per block** then concatenated (no cross-block windows).
     """
     set_all_seeds(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = generate_normal(duration_s=duration_s, seed=seed)
-    batch = extract_features(df, window_n=WINDOW_N, stride=WINDOW_STRIDE)
-    assert (batch.y == 0).all(), "NORMAL stream must yield only normal windows"
-    X = batch.X
-    X_train, X_val, X_test = split_normal_windows(
-        X, seed=seed, train_frac=0.55, val_frac=val_frac, temporal=True,
-    )
+    # Compact layout for unit tests that pass a short duration_s without block kwargs
+    if duration_s < 60.0 and n_blocks == 12 and block_duration_s == 200.0:
+        n_blocks = 4
+        block_duration_s = max(float(duration_s), 6.0)
+        n_train_blocks, n_earlystop_blocks, n_calib_blocks, n_test_blocks = 1, 1, 1, 1
+
+    assert n_train_blocks + n_earlystop_blocks + n_calib_blocks + n_test_blocks == n_blocks
+
+    seeds = _block_seeds(seed, n_blocks=n_blocks)
+
+    def _feats(block_seed: int) -> np.ndarray:
+        df = generate_normal(duration_s=block_duration_s, seed=block_seed)
+        batch = extract_features(df, window_n=WINDOW_N, stride=WINDOW_STRIDE)
+        assert (batch.y == 0).all()
+        return batch.X
+
+    train_seeds = seeds[:n_train_blocks]
+    early_seeds = seeds[n_train_blocks : n_train_blocks + n_earlystop_blocks]
+    calib_seeds = seeds[
+        n_train_blocks + n_earlystop_blocks :
+        n_train_blocks + n_earlystop_blocks + n_calib_blocks
+    ]
+    test_seeds = seeds[n_train_blocks + n_earlystop_blocks + n_calib_blocks :]
+
+    X_train = np.concatenate([_feats(s) for s in train_seeds], axis=0)
+    X_early = np.concatenate([_feats(s) for s in early_seeds], axis=0)
+    X_calib = np.concatenate([_feats(s) for s in calib_seeds], axis=0)
+    X_test = np.concatenate([_feats(s) for s in test_seeds], axis=0)
 
     scaler = FeatureScaler.fit(X_train)
     X_train_s = scaler.transform(X_train)
-    X_val_s = scaler.transform(X_val)
+    X_early_s = scaler.transform(X_early)
+    X_calib_s = scaler.transform(X_calib)
     X_test_s = scaler.transform(X_test)
 
     model = build_model(input_dim=FEATURE_DIM, seed=seed)
     history = train_autoencoder(
-        model, X_train_s, X_val_s, epochs=epochs, patience=15, seed=seed,
+        model, X_train_s, X_early_s, epochs=epochs, patience=15, seed=seed,
     )
 
-    val_err = reconstruction_errors(model, X_val_s)
-    tau = calibrate_threshold(val_err, percentile=99.0)
+    # τ from calibration blocks ONLY (not early-stop) — DESIGN: held-out NORMAL p99
+    calib_err = reconstruction_errors(model, X_calib_s)
+    tau = calibrate_threshold(calib_err, percentile=99.0)
     test_err = reconstruction_errors(model, X_test_s)
     fpr_test = float((test_err > tau).mean()) if len(test_err) else float("nan")
 
@@ -192,19 +233,28 @@ def run_training_pipeline(
         "seed": seed,
         "tau": tau,
         "percentile": 99.0,
-        "tau_calibration_split": "temporal_held_out_NORMAL_val",
+        "tau_calibration_split": "ordered_independent_NORMAL_calib_blocks",
         "fpr_split_description": (
-            "same-stream temporal test split of a long NORMAL generator stream "
-            "(train/val/test contiguous); τ = p99(val); val enlarged for FPR stability"
+            "FPR on held-out independent NORMAL test blocks; "
+            "τ = p99 of pooled independent NORMAL calibration blocks "
+            "(predetermined seeds; never chosen by scores; never attack)"
         ),
         "fpr_test_normal": fpr_test,
         "n_train": int(len(X_train)),
-        "n_val": int(len(X_val)),
-        "n_val_effective_indep": int(effective_independent_windows(len(X_val))),
+        "n_earlystop": int(len(X_early)),
+        "n_val": int(len(X_calib)),  # calib = τ source
+        "n_val_effective_indep": int(effective_independent_windows(len(X_calib))),
+        "n_calib_blocks": int(n_calib_blocks),
         "n_test": int(len(X_test)),
         "n_test_effective_indep": int(effective_independent_windows(len(X_test))),
-        "val_frac": float(val_frac),
-        "normal_duration_s": float(duration_s),
+        "block_duration_s": float(block_duration_s),
+        "n_blocks": int(n_blocks),
+        "block_seeds": {
+            "train": train_seeds,
+            "earlystop": early_seeds,
+            "calib": calib_seeds,
+            "test": test_seeds,
+        },
         "feature_dim": FEATURE_DIM,
         "scaler": scaler.to_dict(),
         "history": {

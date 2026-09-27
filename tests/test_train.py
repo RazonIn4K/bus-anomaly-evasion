@@ -53,14 +53,20 @@ def test_threshold_never_fit_on_attack():
 
 
 def test_train_pipeline_deterministic_tau(tmp_path):
-    r1 = run_training_pipeline(seed=0, duration_s=25.0, out_dir=tmp_path / "a", epochs=20)
-    r2 = run_training_pipeline(seed=0, duration_s=25.0, out_dir=tmp_path / "b", epochs=20)
+    r1 = run_training_pipeline(seed=0, out_dir=tmp_path / "a", epochs=15,
+                               n_blocks=4, block_duration_s=8.0,
+                               n_train_blocks=1, n_earlystop_blocks=1,
+                               n_calib_blocks=1, n_test_blocks=1)
+    r2 = run_training_pipeline(seed=0, out_dir=tmp_path / "b", epochs=15,
+                               n_blocks=4, block_duration_s=8.0,
+                               n_train_blocks=1, n_earlystop_blocks=1,
+                               n_calib_blocks=1, n_test_blocks=1)
     assert abs(r1["tau"] - r2["tau"]) < 1e-6
     assert r1["meta"]["n_train"] > 0
     assert r1["meta"]["n_val"] > 0
     # FPR on held-out NORMAL test should be near 1%
     assert 0.0 <= r1["meta"]["fpr_test_normal"] <= 0.15
-    assert r1["meta"]["tau_calibration_split"] == "temporal_held_out_NORMAL_val"
+    assert r1["meta"]["tau_calibration_split"] == "ordered_independent_NORMAL_calib_blocks"
 
 
 def test_model_architecture():

@@ -41,14 +41,19 @@ def _json_safe(obj):
 
 
 
-def run_seed(seed: int, out_dir: Path, duration_normal: float = 360.0, epochs: int = 60) -> dict:
+def run_seed(seed: int, out_dir: Path, duration_normal: float = 200.0, epochs: int = 60) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     train = run_training_pipeline(
         seed=seed,
-        duration_s=duration_normal,
+        duration_s=duration_normal,  # API compat; blocks use block_duration_s=200
         out_dir=out_dir,
         epochs=epochs,
-        val_frac=0.25,
+        n_blocks=12,
+        block_duration_s=200.0,
+        n_train_blocks=6,
+        n_earlystop_blocks=1,
+        n_calib_blocks=3,
+        n_test_blocks=2,
     )
     model, scaler, tau = train["model"], train["scaler"], train["tau"]
 
@@ -257,7 +262,7 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
         f"- Seeds: `{agg['seeds']}`",
         f"- Threshold rule: τ = p99 MSE on held-out NORMAL validation (never attack/test).",
-        f"- τ calibration split: **`{cal}`** (temporal early/mid/late contiguous windows; enlarged val).",
+        f"- τ calibration split: **`{cal}`** (ordered independent NORMAL calibration blocks; p99 primary).",
         f"- Mean val windows / seed: **{_fmt(agg.get('n_val_windows_mean'), 1)}** "
         f"(effective indep ≈ **{_fmt(agg.get('n_val_effective_indep_mean'), 1)}**)",
         f"- Same-stream split FPR (mean±std): "

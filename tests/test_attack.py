@@ -40,8 +40,8 @@ def test_normal_byte_means_are_per_position():
     for cid, vec in means.items():
         assert isinstance(vec, np.ndarray)
         assert vec.shape == (8,)
-    # const ID 0x150 has distinct per-position constants
-    assert means[0x150][0] != means[0x150][7] or True
+    # const ID 0x150 encodes distinct per-position constants
+    assert means[0x150][0] != means[0x150][7]
 
 
 def test_torch_byte_stats_match_numpy():
@@ -123,7 +123,7 @@ def test_thin_stream_feasible_bytes():
     th = thin_attack_stream(atk, "flood", rng, keep_frac=0.3, normal_byte_means=nb)
     for b in range(8):
         assert th[f"b{b}"].between(0, 255).all()
-    assert th["timestamp"].is_monotonic_increasing or True
+    assert th["timestamp"].is_monotonic_increasing
 
 
 def test_objective_injection():
