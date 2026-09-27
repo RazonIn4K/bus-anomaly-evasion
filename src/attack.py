@@ -408,6 +408,50 @@ def gated_detection_rate(
     return float((errors[mask] > tau).mean())
 
 
+def _mimicry_grid() -> list:
+    return [
+        None,  # identity (no morph)
+        {"keep_frac": 0.6, "spoof_blend": 0.0, "byte_strength": 0.5},
+        {"keep_frac": 0.35, "spoof_blend": 0.15, "byte_strength": 0.8},
+        {"keep_frac": 0.2, "spoof_blend": 0.3, "byte_strength": 1.0},
+    ]
+
+
+def _score_mimicry_params(
+    model: Autoencoder,
+    scaler: FeatureScaler,
+    attack_df: pd.DataFrame,
+    family: str,
+    params: Optional[dict],
+    nb: dict,
+    rng: np.random.Generator,
+) -> tuple[float, Optional[tuple]]:
+    """Return (score, packed_arrays_or_None). Lower score is better."""
+    n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
+    if params is None:
+        e_err, e_feat, retained = n_err, n_feat, np.ones(len(n_err))
+        m = len(n_err)
+        if m == 0:
+            return float("inf"), None
+        score = float(np.mean(e_err))
+        viol = [0] * m
+        return score, (n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
+
+    thinned = thin_attack_stream(
+        attack_df, family, rng, normal_byte_means=nb, **params,
+    )
+    e_err, e_feat, retained, _ = _window_errors(model, scaler, thinned, family)
+    if len(e_err) == 0:
+        return float("inf"), None
+    m = min(len(n_err), len(e_err))
+    score = float(np.mean(e_err[:m]))
+    ret_mean = float(np.mean(retained[:m])) if m else 0.0
+    if ret_mean < 0.7:
+        score += 1e3  # heavily penalize objective collapse
+    viol = [constraint_violations(e_feat[i]) > 0 for i in range(m)]
+    return score, (n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
+
+
 def mimicry_evade(
     model: Autoencoder,
     scaler: FeatureScaler,
@@ -415,48 +459,41 @@ def mimicry_evade(
     normal_df: pd.DataFrame,
     family: str,
     seed: int = 0,
+    select_df: Optional[pd.DataFrame] = None,
 ) -> EvasionResult:
-    """Black-box mimicry: grid-search keep_frac / blends; pick lowest mean error."""
-    rng = np.random.default_rng(seed)
+    """Black-box mimicry: select grid params on ``select_df``, score on ``attack_df``.
+
+    When ``select_df`` is provided (recommended), grid-search uses that stream so
+    parameter choice is not fit on the evaluated attack seed (selection-bias guard).
+    If omitted, falls back to selecting on ``attack_df`` (legacy / unit tests).
+    """
+    rng_select = np.random.default_rng(seed)
+    rng_score = np.random.default_rng(seed + 7919)
     nb = estimate_normal_byte_means(normal_df)
-    n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
+    grid = _mimicry_grid()
+    select_stream = select_df if select_df is not None else attack_df
 
-    grid = [
-        None,  # identity (no morph)
-        {"keep_frac": 0.6, "spoof_blend": 0.0, "byte_strength": 0.5},
-        {"keep_frac": 0.35, "spoof_blend": 0.15, "byte_strength": 0.8},
-        {"keep_frac": 0.2, "spoof_blend": 0.3, "byte_strength": 1.0},
-    ]
-    best = None
+    best_params = None
+    best_select_score = float("inf")
     for params in grid:
-        if params is None:
-            e_err, e_feat, retained = n_err, n_feat, np.ones(len(n_err))
-            m = len(n_err)
-            score = float(np.mean(e_err)) if m else float("inf")
-            viol = [0] * m
-            cand = (score, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
-        else:
-            thinned = thin_attack_stream(
-                attack_df, family, rng, normal_byte_means=nb, **params,
-            )
-            e_err, e_feat, retained, _ = _window_errors(model, scaler, thinned, family)
-            if len(e_err) == 0:
-                continue
-            m = min(len(n_err), len(e_err))
-            score = float(np.mean(e_err[:m]))
-            # Prefer candidates that retain objective on most windows
-            ret_mean = float(np.mean(retained[:m])) if m else 0.0
-            if ret_mean < 0.7:
-                score += 1e3  # heavily penalize objective collapse
-            viol = [constraint_violations(e_feat[i]) > 0 for i in range(m)]
-            cand = (score, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m], retained[:m], viol)
-        if best is None or cand[0] < best[0]:
-            best = cand
+        score, _ = _score_mimicry_params(
+            model, scaler, select_stream, family, params, nb, rng_select,
+        )
+        if score < best_select_score:
+            best_select_score = score
+            best_params = params
 
-    if best is None:
-        return _pack("mimicry", family, n_err, n_err, n_feat, n_feat,
-                     np.ones(len(n_err)), [0] * len(n_err))
-    _, n_e, e_e, n_f, e_f, ret, viol = best
+    # Fresh RNG for scoring morph so thinning draws are independent of select
+    _, packed = _score_mimicry_params(
+        model, scaler, attack_df, family, best_params, nb, rng_score,
+    )
+    if packed is None:
+        n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
+        return _pack(
+            "mimicry", family, n_err, n_err, n_feat, n_feat,
+            np.ones(len(n_err)), [0] * len(n_err),
+        )
+    n_e, e_e, n_f, e_f, ret, viol = packed
     return _pack("mimicry", family, n_e, e_e, n_f, e_f, ret, viol)
 
 
@@ -697,8 +734,17 @@ def run_evasion_suite(
         kwargs = {}
         if fam == "spoof":
             kwargs["target_phys"] = 115.0
-        atk = generate_attack(fam, duration_s=duration_s, seed=seed + 20 + i, **kwargs)
-        mim = mimicry_evade(model, scaler, atk, normal_df, fam, seed=seed + 100 + i)
+        # Separate seeds: select mimicry params on one stream, score on another
+        atk_select = generate_attack(
+            fam, duration_s=duration_s, seed=seed + 20 + i, **kwargs,
+        )
+        atk = generate_attack(
+            fam, duration_s=duration_s, seed=seed + 120 + i, **kwargs,
+        )
+        mim = mimicry_evade(
+            model, scaler, atk, normal_df, fam, seed=seed + 100 + i,
+            select_df=atk_select,
+        )
         pgd = pgd_evade(model, scaler, atk, normal_df, fam, seed=seed + 200 + i)
 
         # Ungated (secondary): all windows
