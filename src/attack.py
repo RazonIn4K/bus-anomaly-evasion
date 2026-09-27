@@ -409,11 +409,17 @@ def gated_detection_rate(
 
 
 def _mimicry_grid() -> list:
+    # inject_min_rate_hz may be lowered vs default 15 so thinning can meet the
+    # window objective (≥2 inject frames) without a 15Hz floor that keeps recon>τ
+    # on sensitive detectors. Still selected on select_df only (not score seed).
     return [
         None,  # identity (no morph)
         {"keep_frac": 0.6, "spoof_blend": 0.0, "byte_strength": 0.5},
         {"keep_frac": 0.35, "spoof_blend": 0.15, "byte_strength": 0.8},
         {"keep_frac": 0.2, "spoof_blend": 0.3, "byte_strength": 1.0},
+        {"keep_frac": 0.25, "spoof_blend": 0.0, "byte_strength": 1.0, "inject_min_rate_hz": 5.0},
+        {"keep_frac": 0.15, "spoof_blend": 0.0, "byte_strength": 1.0, "inject_min_rate_hz": 3.0},
+        {"keep_frac": 0.1, "spoof_blend": 0.0, "byte_strength": 1.0, "inject_min_rate_hz": 2.0},
     ]
 
 
