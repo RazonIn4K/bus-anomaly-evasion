@@ -594,14 +594,19 @@ def pgd_frame_bytes(
     step_size: float = 4.0,
     eps: float = 48.0,
 ) -> tuple[pd.DataFrame, str]:
-    """Frame-space PGD on free bytes with in-loop Π_C = clip to [0,255] ∩ L∞ ball.
+    """Frame-space sign-PGD on free bytes; Π_C = L∞ then [0,255] every step.
 
-    Returns (morphed_window_df, path_label). Path is ``true_pgd`` when free bytes
-    existed and PGD ran; ``naive_fallback`` otherwise.
+    Returns (morphed_window_df, path_label). Path is ``true_pgd`` only when at
+    least one free byte lies on a TOP_IDS frame (differentiable lever); otherwise
+    ``naive_fallback``. Scoring must use the original numpy extractor after a
+    single final round — never the torch forward alone.
     """
     w = window_df.copy().reset_index(drop=True)
     free = _free_byte_mask(w, family)
-    if not free.any():
+    ids_arr = w["can_id"].to_numpy(dtype=np.int64)
+    top_rows = np.isin(ids_arr, list(TOP_IDS))
+    effective = free & top_rows[:, None]
+    if not effective.any():
         return w, PATH_NAIVE_FALLBACK
 
     ts, ids, data = frames_from_df(w)
@@ -627,9 +632,9 @@ def pgd_frame_bytes(
         loss.backward()
         with torch.no_grad():
             grad = x.grad
-            # Gradient step on free bytes only
-            x_step = x - step_size * grad * free_t
-            # Π_C in-loop: L∞ ball around originals ∩ [0, 255]; non-free frozen
+            # Sign-PGD: step_size is in byte levels (interpretable)
+            x_step = x - step_size * grad.sign() * free_t
+            # Π_C order: L∞ ball around x0, then [0, 255]; non-free frozen
             delta = (x_step - x0).clamp(-float(eps), float(eps))
             x_proj = torch.where(
                 free_t.bool(),
@@ -638,8 +643,8 @@ def pgd_frame_bytes(
             )
             x = x_proj.detach().requires_grad_(True)
 
-    # Quantize free bytes; re-verify happens in caller via original extractor
-    final = x.detach().numpy()
+    # Single final quantization of free bytes only; caller re-extracts with numpy
+    final = x.detach().cpu().numpy()
     for i in range(len(w)):
         for b in range(8):
             if free[i, b]:
@@ -736,11 +741,14 @@ def run_evasion_suite(
         if fam == "spoof":
             kwargs["target_phys"] = 115.0
         # Separate seeds: select mimicry params on one stream, score on another
+        select_seed = seed + 20 + i
+        score_seed = seed + 120 + i
+        assert select_seed != score_seed, "mimicry select/score seeds must differ"
         atk_select = generate_attack(
-            fam, duration_s=duration_s, seed=seed + 20 + i, **kwargs,
+            fam, duration_s=duration_s, seed=select_seed, **kwargs,
         )
         atk = generate_attack(
-            fam, duration_s=duration_s, seed=seed + 120 + i, **kwargs,
+            fam, duration_s=duration_s, seed=score_seed, **kwargs,
         )
         mim = mimicry_evade(
             model, scaler, atk, normal_df, fam, seed=seed + 100 + i,
