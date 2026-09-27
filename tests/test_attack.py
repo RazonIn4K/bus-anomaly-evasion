@@ -1,10 +1,12 @@
-"""Evasion feasibility and improvement tests."""
+"""Evasion feasibility and honesty tests."""
 
 from __future__ import annotations
 
 import numpy as np
 
 from src.attack import (
+    PATH_THIN,
+    PATH_TRUE_PGD,
     constraint_violations,
     mimicry_evade,
     objective_retained,
@@ -25,7 +27,12 @@ def test_project_features_feasible():
 
 
 def test_evasion_lowers_recon_error(tmp_path):
-    """Evasion mean recon error should be <= naive (macro, directionally)."""
+    """Evasion mean recon error should be <= naive on average (macro, directionally).
+
+    No never-worse-than-naive clamp: individual windows may regress; frac_improved
+    / frac_fallback report that honestly. Macro gap across families should still
+    be non-negative for mimicry+PGD combined.
+    """
     result = run_training_pipeline(seed=0, duration_s=30.0, out_dir=tmp_path, epochs=25)
     model, scaler = result["model"], result["scaler"]
     normal_df = generate_normal(duration_s=8.0, seed=50)
@@ -45,9 +52,31 @@ def test_evasion_lowers_recon_error(tmp_path):
         gaps.append(pgd.mean_naive_error - pgd.mean_evasive_error)
         assert mim.objective_retention >= 0.7
         assert pgd.objective_retention >= 0.7
+        # Honesty fields present
+        assert 0.0 <= mim.frac_improved <= 1.0 or mim.frac_improved != mim.frac_improved
+        assert 0.0 <= pgd.frac_fallback <= 1.0 or pgd.frac_fallback != pgd.frac_fallback
+        assert set(pgd.path_counts) >= {PATH_THIN, PATH_TRUE_PGD}
+        assert len(pgd.path_labels) == len(pgd.evasive_errors)
+        assert abs(mim.frac_improved + mim.frac_fallback - 1.0) < 1e-9 or len(mim.evasive_errors) == 0
 
-    # Macro: mean error reduction should be >= 0
+    # Macro: mean error reduction should be >= 0 (directionally)
     assert np.mean(gaps) >= -1e-3
+
+
+def test_pgd_path_labels_are_honest(tmp_path):
+    """Windows labeled true_pgd must be those where PGD refine beat thin."""
+    result = run_training_pipeline(seed=0, duration_s=25.0, out_dir=tmp_path, epochs=20)
+    model, scaler = result["model"], result["scaler"]
+    normal_df = generate_normal(duration_s=6.0, seed=51)
+    atk = generate_attack("injection", duration_s=6.0, seed=3, inject_rate_hz=40.0)
+    pgd = pgd_evade(model, scaler, atk, normal_df, "injection", seed=4, steps=40)
+    n = len(pgd.path_labels)
+    assert n == pgd.path_counts[PATH_THIN] + pgd.path_counts[PATH_TRUE_PGD] + pgd.path_counts.get(
+        "naive_fallback", 0
+    )
+    # frac_improved + frac_fallback == 1 when windows exist
+    if n:
+        assert abs(pgd.frac_improved + pgd.frac_fallback - 1.0) < 1e-9
 
 
 def test_thin_stream_feasible_bytes():

@@ -60,6 +60,7 @@ def test_train_pipeline_deterministic_tau(tmp_path):
     assert r1["meta"]["n_val"] > 0
     # FPR on held-out NORMAL test should be near 1%
     assert 0.0 <= r1["meta"]["fpr_test_normal"] <= 0.15
+    assert r1["meta"]["tau_calibration_split"] == "temporal_held_out_NORMAL_val"
 
 
 def test_model_architecture():
@@ -67,3 +68,12 @@ def test_model_architecture():
     x = torch.randn(4, FEATURE_DIM)
     y = m(x)
     assert y.shape == x.shape
+
+
+def test_temporal_split_contiguous():
+    X = np.arange(100).reshape(100, 1).astype(np.float64)
+    tr, va, te = split_normal_windows(X, seed=0, temporal=True)
+    assert tr[-1, 0] < va[0, 0] < te[0, 0] or (tr[-1, 0] + 1 == va[0, 0])
+    # contiguous blocks
+    assert tr[-1, 0] + 1 == va[0, 0]
+    assert va[-1, 0] + 1 == te[0, 0]
