@@ -8,9 +8,12 @@ attack-objective constraint. A detector trained only on "normal" traffic flags
 what it can't reconstruct; a shaped attack that sits on the normal manifold slips
 under the threshold.
 
-> **Key finding:** The autoencoder's decisions are driven by message structure (rates, timing, ID mix), not payload content. Consequences: payload-only attacks (spoof, replay) are invisible to it; white-box PGD on payload bytes lowers reconstruction error in 99% of windows but can't cross τ; only rate-shaping mimicry evades, cutting injection detection from 100% to 84% on average (seed 2: no reduction). Flood/drop dominate the structural features and can't be evaded while keeping their objective.
+> **Key finding (this experiment):** For this synthetic AE and feature set (seeds 0–2), decisions are driven mainly by message structure (rates, timing, ID mix), not free payload content under the attacks we tested. Evidence from `results/aggregate.json`:
+> - **Spoof / replay:** naive mean recon ≈**0.23** ≪ τ≈**0.53**, so payload-only attacks are largely invisible here (spoof naive TPR **0.0000**; replay naive TPR **0.0167** — tiny, not absolute zero).
+> - **Frame-space PGD (injection):** lowers recon in ~**99%** of injection windows (`frac_improved` **0.99**) but mean recon stays above τ (**1.38** vs **0.53**) under free-byte + objective freeze — a ceiling for *this* attack class and constraint set, not a claim that white-box payload PGD is impossible in general.
+> - **Mimicry:** the only rate-shaping family that partly reduces detection — injection TPR **100% → 84%** mean (seed 2: Δ=**0**). Flood/drop still dominate structural features and stay non-evadable while keeping their objective under the tested constraints.
+> Gate status unchanged: **GATES_PASS=False** (FPR PASS; all-seed inj FAIL).
 
-Supporting recon @τ≈0.53 (`results/aggregate.json`): injection mean recon naive **1.52** / mimicry **0.79** / PGD **1.38**; PGD `frac_improved` **0.99**; spoof/replay naive recon ≈**0.23** (< τ).
 
 > **Synthetic only.** Portfolio research artifact. Not a real vehicle bus, not a
 > production IDS, no HIL claims.
