@@ -40,8 +40,15 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 45.0, epochs: in
     summary = {
         "seed": seed,
         "tau": tau,
-        "fpr_test_normal_split": train["meta"]["fpr_test_normal"],
-        "fpr_fresh_normal_stream": fpr_stream["fpr"] if fpr_stream["fpr"] == fpr_stream["fpr"] else fpr_stream["alert_rate"],
+        "tau_calibration_split": train["meta"].get(
+            "tau_calibration_split", "temporal_held_out_NORMAL_val"
+        ),
+        "fpr_same_stream_split": train["meta"]["fpr_test_normal"],
+        "fpr_test_normal_split": train["meta"]["fpr_test_normal"],  # alias
+        "fpr_fresh_normal_stream": (
+            fpr_stream["fpr"] if fpr_stream["fpr"] == fpr_stream["fpr"]
+            else fpr_stream["alert_rate"]
+        ),
         "naive_overall_tpr": naive["tpr"],
         "naive_roc_auc": naive["roc_auc"],
         "naive_family_tables": {
@@ -63,60 +70,88 @@ def aggregate(summaries: list[dict]) -> dict:
     families = list(summaries[0]["evasion"].keys())
     agg = {"seeds": [s["seed"] for s in summaries], "families": {}, "macro": {}}
 
-    fprs = [s["fpr_test_normal_split"] for s in summaries]
-    agg["fpr_at_tau_mean"] = float(np.mean(fprs))
-    agg["fpr_at_tau_std"] = float(np.std(fprs))
+    fprs_split = [s.get("fpr_same_stream_split", s["fpr_test_normal_split"]) for s in summaries]
+    fprs_fresh = [s["fpr_fresh_normal_stream"] for s in summaries]
+    agg["fpr_same_stream_split_mean"] = float(np.mean(fprs_split))
+    agg["fpr_same_stream_split_std"] = float(np.std(fprs_split))
+    agg["fpr_fresh_normal_mean"] = float(np.mean(fprs_fresh))
+    agg["fpr_fresh_normal_std"] = float(np.std(fprs_fresh))
+    # Back-compat aliases (same-stream split)
+    agg["fpr_at_tau_mean"] = agg["fpr_same_stream_split_mean"]
+    agg["fpr_at_tau_std"] = agg["fpr_same_stream_split_std"]
     agg["tau_mean"] = float(np.mean([s["tau"] for s in summaries]))
+    agg["tau_calibration_split"] = summaries[0].get(
+        "tau_calibration_split", "temporal_held_out_NORMAL_val"
+    )
 
-    macro_naive, macro_mim, macro_pgd = [], [], []
-    macro_d_mim, macro_d_pgd = [], []
-    recon_naive, recon_mim, recon_pgd = [], [], []
+    keys = [
+        "tpr_naive", "tpr_naive_pgd_matched", "tpr_mimicry", "tpr_pgd",
+        "delta_tpr_mimicry", "delta_tpr_pgd",
+        "tpr_naive_ungated", "tpr_mimicry_ungated", "tpr_pgd_ungated",
+        "delta_tpr_mimicry_ungated", "delta_tpr_pgd_ungated",
+        "mean_recon_naive", "mean_recon_mimicry", "mean_recon_pgd",
+        "mean_recon_pgd_all_paths", "mean_recon_naive_pgd_matched",
+        "obj_retention_mimicry", "obj_retention_pgd",
+        "constraint_viol_mimicry", "constraint_viol_pgd",
+        "frac_improved_mimicry", "frac_fallback_mimicry",
+        "frac_improved_pgd", "frac_fallback_pgd",
+        "n_true_pgd", "n_thin", "n_naive_fallback",
+    ]
+
+    macro_acc = {k: [] for k in (
+        "tpr_naive", "tpr_mimicry", "tpr_pgd",
+        "tpr_naive_pgd_matched",
+        "delta_tpr_mimicry", "delta_tpr_pgd",
+        "tpr_mimicry_ungated", "tpr_pgd_ungated",
+        "delta_tpr_mimicry_ungated", "delta_tpr_pgd_ungated",
+        "mean_recon_naive", "mean_recon_mimicry", "mean_recon_pgd",
+        "frac_improved_pgd", "frac_fallback_pgd",
+        "n_true_pgd", "n_thin", "n_naive_fallback",
+    )}
 
     for fam in families:
         rows = [s["evasion"][fam] for s in summaries]
+
         def _m(key):
-            vals = [r[key] for r in rows if r[key] == r[key]]
+            vals = []
+            for r in rows:
+                if key not in r:
+                    continue
+                v = r[key]
+                if isinstance(v, (int, float)) and v == v:
+                    vals.append(float(v))
             return float(np.mean(vals)) if vals else float("nan")
 
-        entry = {
-            "tpr_naive": _m("tpr_naive"),
-            "tpr_mimicry": _m("tpr_mimicry"),
-            "tpr_pgd": _m("tpr_pgd"),
-            "delta_tpr_mimicry": _m("delta_tpr_mimicry"),
-            "delta_tpr_pgd": _m("delta_tpr_pgd"),
-            "mean_recon_naive": _m("mean_recon_naive"),
-            "mean_recon_mimicry": _m("mean_recon_mimicry"),
-            "mean_recon_pgd": _m("mean_recon_pgd"),
-            "obj_retention_mimicry": _m("obj_retention_mimicry"),
-            "obj_retention_pgd": _m("obj_retention_pgd"),
-            "constraint_viol_mimicry": _m("constraint_viol_mimicry"),
-            "constraint_viol_pgd": _m("constraint_viol_pgd"),
+        entry = {k: _m(k) for k in keys}
+        # Sum path counts across seeds then we also keep means; store mean counts
+        entry["path_counts_pgd"] = {
+            "thin": entry["n_thin"],
+            "true_pgd": entry["n_true_pgd"],
+            "naive_fallback": entry["n_naive_fallback"],
         }
         agg["families"][fam] = entry
-        macro_naive.append(entry["tpr_naive"])
-        macro_mim.append(entry["tpr_mimicry"])
-        macro_pgd.append(entry["tpr_pgd"])
-        macro_d_mim.append(entry["delta_tpr_mimicry"])
-        macro_d_pgd.append(entry["delta_tpr_pgd"])
-        recon_naive.append(entry["mean_recon_naive"])
-        recon_mim.append(entry["mean_recon_mimicry"])
-        recon_pgd.append(entry["mean_recon_pgd"])
+        for k in macro_acc:
+            macro_acc[k].append(entry[k])
 
-    agg["macro"] = {
-        "tpr_naive": float(np.nanmean(macro_naive)),
-        "tpr_mimicry": float(np.nanmean(macro_mim)),
-        "tpr_pgd": float(np.nanmean(macro_pgd)),
-        "delta_tpr_mimicry": float(np.nanmean(macro_d_mim)),
-        "delta_tpr_pgd": float(np.nanmean(macro_d_pgd)),
-        "mean_recon_naive": float(np.nanmean(recon_naive)),
-        "mean_recon_mimicry": float(np.nanmean(recon_mim)),
-        "mean_recon_pgd": float(np.nanmean(recon_pgd)),
+    agg["macro"] = {k: float(np.nanmean(v)) for k, v in macro_acc.items()}
+    agg["macro"]["path_counts_pgd"] = {
+        "thin": agg["macro"]["n_thin"],
+        "true_pgd": agg["macro"]["n_true_pgd"],
+        "naive_fallback": agg["macro"]["n_naive_fallback"],
     }
     return agg
 
 
 def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
     m = agg["macro"]
+    pc = m.get("path_counts_pgd", {})
+    cal = agg.get("tau_calibration_split", "temporal_held_out_NORMAL_val")
+
+    def _fmt(x, nd=4):
+        if x != x:
+            return "nan"
+        return f"{x:.{nd}f}"
+
     lines = [
         "# Results Report — Bus Anomaly Evasion",
         "",
@@ -126,67 +161,103 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
         f"- Seeds: `{agg['seeds']}`",
         f"- Threshold rule: τ = p99 MSE on held-out NORMAL validation (never attack/test).",
-        f"- Empirical FPR on NORMAL test split (mean±std): "
-        f"**{agg['fpr_at_tau_mean']:.4f} ± {agg['fpr_at_tau_std']:.4f}**",
+        f"- τ calibration split: **`{cal}`** (temporal early/mid/late contiguous windows).",
+        f"- Same-stream split FPR (mean±std): "
+        f"**{_fmt(agg['fpr_same_stream_split_mean'])} ± {_fmt(agg['fpr_same_stream_split_std'])}**",
+        f"- Fresh-normal FPR (mean±std): "
+        f"**{_fmt(agg['fpr_fresh_normal_mean'])} ± {_fmt(agg['fpr_fresh_normal_std'])}**",
         f"- Mean τ: `{agg['tau_mean']:.6f}`",
         "",
-        "## Headline metrics (macro-average over attack families)",
+        "## Headline metrics (objective-gated; PGD = true_pgd path only)",
         "",
-        "| Method | TPR | ΔTPR vs naive | Mean recon MSE |",
+        "Primary TPR / ΔTPR require `objective_retained`. Constrained PGD headline",
+        "further requires path=`true_pgd` (rate-thinning is **not** counted as PGD).",
+        "Ungated numbers are secondary only.",
+        "",
+        "| Method | TPR (gated) | ΔTPR vs naive | Mean recon MSE |",
         "| --- | ---: | ---: | ---: |",
-        f"| Naive | {m['tpr_naive']:.4f} | — | {m['mean_recon_naive']:.6f} |",
-        f"| Mimicry | {m['tpr_mimicry']:.4f} | {m['delta_tpr_mimicry']:.4f} | {m['mean_recon_mimicry']:.6f} |",
-        f"| Constrained PGD | {m['tpr_pgd']:.4f} | {m['delta_tpr_pgd']:.4f} | {m['mean_recon_pgd']:.6f} |",
+        f"| Naive (obj-gated / PGD-matched) | {_fmt(m.get('tpr_naive_pgd_matched', m['tpr_naive']))} | — | {_fmt(m['mean_recon_naive'], 6)} |",
+        f"| Mimicry | {_fmt(m['tpr_mimicry'])} | {_fmt(m['delta_tpr_mimicry'])} | {_fmt(m['mean_recon_mimicry'], 6)} |",
+        f"| Constrained PGD (true_pgd) | {_fmt(m['tpr_pgd'])} | {_fmt(m['delta_tpr_pgd'])} | {_fmt(m['mean_recon_pgd'], 6)} |",
         "",
-        f"**Headline ΔTPR (naive − PGD):** `{m['delta_tpr_pgd']:.4f}`",
+        f"**Headline ΔTPR (naive − true_pgd, objective-gated):** `{_fmt(m['delta_tpr_pgd'])}`",
         "",
-        "## Per-family table (mean over seeds)",
+        "### PGD path counts (mean windows / family / seed)",
         "",
-        "| Family | TPR naive | TPR mimicry | TPR PGD | ΔTPR PGD | "
-        "Recon naive | Recon PGD | Obj ret PGD | Viol PGD |",
+        f"- thin: **{_fmt(pc.get('thin', m.get('n_thin', float('nan'))), 2)}**",
+        f"- true_pgd: **{_fmt(pc.get('true_pgd', m.get('n_true_pgd', float('nan'))), 2)}**",
+        f"- naive_fallback: **{_fmt(pc.get('naive_fallback', m.get('n_naive_fallback', float('nan'))), 2)}**",
+        "",
+        f"- frac_improved (PGD all paths, recon < naive): **{_fmt(m.get('frac_improved_pgd'))}**",
+        f"- frac_fallback (PGD all paths, recon ≥ naive; no clamp): **{_fmt(m.get('frac_fallback_pgd'))}**",
+        "",
+        "### Secondary (ungated)",
+        "",
+        f"- Mimicry ungated ΔTPR: `{_fmt(m.get('delta_tpr_mimicry_ungated'))}` "
+        f"(TPR `{_fmt(m.get('tpr_mimicry_ungated'))}`)",
+        f"- PGD ungated ΔTPR (all paths, may include thin): `{_fmt(m.get('delta_tpr_pgd_ungated'))}` "
+        f"(TPR `{_fmt(m.get('tpr_pgd_ungated'))}`)",
+        "",
+        "## Per-family table (mean over seeds; primary gated)",
+        "",
+        "| Family | TPR naive† | TPR mim | TPR true_pgd | ΔTPR PGD | "
+        "thin/true_pgd/fb | frac_imp | frac_fb | Obj ret PGD |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for fam, e in agg["families"].items():
+        pc_f = e.get("path_counts_pgd", {})
+        paths = (
+            f"{_fmt(pc_f.get('thin', e.get('n_thin')), 1)}/"
+            f"{_fmt(pc_f.get('true_pgd', e.get('n_true_pgd')), 1)}/"
+            f"{_fmt(pc_f.get('naive_fallback', e.get('n_naive_fallback')), 1)}"
+        )
+        naive_t = e.get("tpr_naive_pgd_matched", e["tpr_naive"])
         lines.append(
-            f"| {fam} | {e['tpr_naive']:.4f} | {e['tpr_mimicry']:.4f} | {e['tpr_pgd']:.4f} | "
-            f"{e['delta_tpr_pgd']:.4f} | {e['mean_recon_naive']:.6f} | {e['mean_recon_pgd']:.6f} | "
-            f"{e['obj_retention_pgd']:.3f} | {e['constraint_viol_pgd']:.3f} |"
+            f"| {fam} | {_fmt(naive_t)} | {_fmt(e['tpr_mimicry'])} | {_fmt(e['tpr_pgd'])} | "
+            f"{_fmt(e['delta_tpr_pgd'])} | {paths} | {_fmt(e.get('frac_improved_pgd'))} | "
+            f"{_fmt(e.get('frac_fallback_pgd'))} | {_fmt(e['obj_retention_pgd'], 3)} |"
         )
 
     lines += [
+        "",
+        "† Naive TPR for PGD Δ is matched to true_pgd ∩ objective_retained windows.",
         "",
         "## Secondary notes",
         "",
         "- Attack-objective retention and constraint-violation rates are reported per family.",
         "- Two-pass verification: feature-space step → frame morph → re-extract → score.",
-        "- Evasion is expected to lower mean reconstruction error vs naive; ΔTPR may be small.",
+        "- Never-worse-than-naive clamp removed: recon MSE and frac_fallback are actual.",
+        "- In-loop Π_C is a soft feature-space clip before frame morph; hard feasibility is",
+        "  enforced by byte quantization (0–255) and two-pass re-extract — residual gap vs a",
+        "  true projective Π_C on the discrete frame set remains (P2 note).",
+        "- Evasion is expected to lower mean reconstruction error vs naive when the morph",
+        "  works; ΔTPR may be small or family-local.",
         "",
         "## Honest gaps",
         "",
     ]
-    # honest commentary based on numbers
-    if m["delta_tpr_pgd"] < 0.05:
+    dpgd = m["delta_tpr_pgd"]
+    if dpgd != dpgd or dpgd < 0.05:
         lines.append(
-            "- ΔTPR is small. That is an acceptable portfolio outcome: the detector still"
-            " catches many evasive windows at fixed FPR≈1%, and we do not inflate the gap."
+            "- Gated true_pgd ΔTPR is small or undefined on some families. Acceptable portfolio"
+            " outcome: we do not inflate PGD by counting rate-thinning as white-box success."
         )
     else:
         lines.append(
-            "- Constrained PGD reduces detection relative to naive at fixed τ; magnitude"
-            " should be read alongside objective-retention (evasion that undoes the attack"
-            " is not counted as success)."
+            "- Constrained true_pgd reduces detection relative to matched naive at fixed τ;"
+            " read alongside objective-retention and path counts."
         )
-    if m["mean_recon_pgd"] < m["mean_recon_naive"]:
+    if m["mean_recon_pgd"] == m["mean_recon_pgd"] and m["mean_recon_pgd"] < m["mean_recon_naive"]:
         lines.append(
-            "- Mean reconstruction error under PGD is lower than naive — evasion directionally correct."
+            "- Mean reconstruction error under true_pgd is lower than naive — directionally correct."
         )
     else:
         lines.append(
-            "- Mean reconstruction error under PGD did not beat naive after two-pass realization;"
-            " feature-space gains did not fully survive frame projection. Reported honestly."
+            "- Mean reconstruction error under true_pgd did not clearly beat naive after two-pass;"
+            " reported honestly (no clamp)."
         )
     lines += [
-        "- Mimicry is the black-box baseline; PGD is the white-box primary demo.",
+        "- Mimicry is the black-box baseline; true PGD is the white-box primary demo.",
         "- No real captures; no HIL; no production claims.",
         "",
         "## Reproduce",
@@ -199,6 +270,7 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
     ]
     path.write_text("\n".join(lines))
+
 
 
 def main() -> None:
