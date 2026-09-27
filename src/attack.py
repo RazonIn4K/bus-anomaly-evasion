@@ -1,14 +1,17 @@
 """Adversarial evasion.
 
 (a) Mimicry (black-box): thin attack streams toward the objective floor and
-    blend free bytes toward NORMAL stats; re-extract windows (two-pass).
-(b) Constrained PGD (white-box): L2 PGD on scaled window features to minimize
-    reconstruction MSE, Π_C projection, then map byte-stat targets back onto
-    the thinned stream and re-extract (two-pass verify).
+    blend free bytes toward per-ID per-position NORMAL stats; re-extract
+    (two-pass).
+(b) Constrained frame-space PGD (white-box): PGD directly on FREE payload
+    bytes of attack frames. A differentiable torch path computes byte
+    mean/std per ID; counts/IAT/entropy stay fixed from the window structure.
+    Every step projects onto [0, 255] ∩ L∞ ball around the original bytes
+    (Π_C in-loop). After optimization, quantize to uint8 and re-verify with
+    the original numpy feature extractor (two-pass).
 
-Evasion should reduce recon error vs naive when the morph works, stay
-bus-feasible, and report honest path attribution (thin vs true PGD) with no
-never-worse-than-naive clamp.
+Thinning is mimicry only — never labeled as PGD. No never-worse-than-naive
+clamp: report actual recon MSE and frac_fallback.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import torch
 from src.features import (
     FEATURE_DIM,
     K,
+    TOP_IDS,
     WINDOW_N,
     FeatureScaler,
     extract_features,
@@ -456,23 +460,156 @@ def mimicry_evade(
     return _pack("mimicry", family, n_e, e_e, n_f, e_f, ret, viol)
 
 
-def pgd_feature_step(
-    model: Autoencoder,
-    x_scaled: torch.Tensor,
-    steps: int = 150,
-    lr: float = 1.0,
+def _free_byte_mask(window_df: pd.DataFrame, family: str) -> np.ndarray:
+    """Boolean mask (N, 8): True where payload bytes may be optimized by PGD.
+
+    Objective-critical bytes stay fixed (spoof phys b0/b1; full replay payload
+    on the replayed ID). On-bus adversary may also morph free mid-bytes of
+    in-TOP_IDS background frames in the window so gradients reach byte_mean/std
+    (inject ID 0x7FF is outside TOP_IDS and does not enter those features).
+    """
+    family = family.lower()
+    n = len(window_df)
+    mask = np.zeros((n, 8), dtype=bool)
+    if n == 0:
+        return mask
+    ids = window_df["can_id"].to_numpy(dtype=np.int64)
+    fams = window_df["attack_family"].to_numpy()
+    top_set = set(TOP_IDS)
+
+    for i in range(n):
+        cid = int(ids[i])
+        af = str(fams[i]) if fams[i] else ""
+        # --- objective-critical freezes ---
+        if family == "spoof" and cid == 0x100 and af == "spoof":
+            mask[i, 2:8] = True  # b0/b1 = spoofed phys
+            continue
+        if family == "replay" and cid == 0x100 and af == "replay":
+            continue  # entire replayed payload fixed
+        if family == "flood" and af == "flood":
+            mask[i, :] = True
+            continue
+        if family == "injection" and cid == INJECT_ID:
+            mask[i, 2:8] = True  # free inject padding (may not affect TOP_IDS stats)
+            continue
+        if family == "drop" and cid in top_set:
+            mask[i, :] = True
+            continue
+        # Background / remaining frames with known IDs: free mid-bytes
+        if cid in top_set:
+            mask[i, 2:8] = True
+    return mask
+
+
+def torch_byte_mean_std(
+    payloads: torch.Tensor,
+    can_ids: np.ndarray,
+    top_ids: tuple[int, ...] = TOP_IDS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable per-ID byte mean and std over an (N, 8) payload tensor.
+
+    Matches ``extract_window_features`` aggregation: flatten all bytes of frames
+    with that ID, then mean / std (std=0 if fewer than 2 values).
+    """
+    k = len(top_ids)
+    device = payloads.device
+    dtype = payloads.dtype
+    byte_mean = torch.zeros(k, device=device, dtype=dtype)
+    byte_std = torch.zeros(k, device=device, dtype=dtype)
+    id_to_idx = {cid: i for i, cid in enumerate(top_ids)}
+    for cid, idx in id_to_idx.items():
+        sel = np.where(can_ids == cid)[0]
+        if sel.size == 0:
+            continue
+        flat = payloads[torch.from_numpy(sel.astype(np.int64)).to(device)].reshape(-1)
+        byte_mean[idx] = flat.mean()
+        if flat.numel() > 1:
+            byte_std[idx] = flat.std(unbiased=False)
+    return byte_mean, byte_std
+
+
+def assemble_torch_features(
+    base_feat: np.ndarray,
+    payloads: torch.Tensor,
+    can_ids: np.ndarray,
+    k: int = K,
 ) -> torch.Tensor:
-    x0 = x_scaled.clone().detach()
-    x_adv = x0.clone().requires_grad_(True)
+    """Replace byte_mean/std slots in ``base_feat`` with differentiable values."""
+    byte_mean, byte_std = torch_byte_mean_std(payloads, can_ids)
+    # Layout: counts(k+1) | iat_mean(k) | iat_std(k) | byte_mean(k) | byte_std(k) | ent
+    b0 = 3 * k + 1
+    parts = [
+        torch.as_tensor(base_feat[:b0], dtype=payloads.dtype, device=payloads.device),
+        byte_mean,
+        byte_std,
+        torch.as_tensor(base_feat[-1:], dtype=payloads.dtype, device=payloads.device),
+    ]
+    return torch.cat(parts, dim=0)
+
+
+def pgd_frame_bytes(
+    model: Autoencoder,
+    scaler: FeatureScaler,
+    window_df: pd.DataFrame,
+    family: str,
+    *,
+    steps: int = 100,
+    step_size: float = 4.0,
+    eps: float = 48.0,
+) -> tuple[pd.DataFrame, str]:
+    """Frame-space PGD on free bytes with in-loop Π_C = clip to [0,255] ∩ L∞ ball.
+
+    Returns (morphed_window_df, path_label). Path is ``true_pgd`` when free bytes
+    existed and PGD ran; ``naive_fallback`` otherwise.
+    """
+    w = window_df.copy().reset_index(drop=True)
+    free = _free_byte_mask(w, family)
+    if not free.any():
+        return w, PATH_NAIVE_FALLBACK
+
+    ts, ids, data = frames_from_df(w)
+    base_feat = project_features(extract_window_features(ts, ids, data))
+    data0 = data.astype(np.float64).copy()
+    free_t = torch.from_numpy(free.astype(np.float32))
+    x0 = torch.from_numpy(data0.astype(np.float32))
+    x = x0.clone().requires_grad_(True)
+
+    mean_t = torch.from_numpy(scaler.mean.astype(np.float32))
+    std_np = np.where(scaler.std < 1e-8, 1.0, scaler.std).astype(np.float32)
+    std_t = torch.from_numpy(std_np)
+    model.eval()
+
     for _ in range(steps):
         model.zero_grad(set_to_none=True)
-        if x_adv.grad is not None:
-            x_adv.grad.zero_()
-        loss = (model(x_adv) - x_adv).pow(2).mean()
+        if x.grad is not None:
+            x.grad.zero_()
+        feat = assemble_torch_features(base_feat, x, ids)
+        feat_s = (feat - mean_t) / std_t
+        recon = model(feat_s.unsqueeze(0)).squeeze(0)
+        loss = (recon - feat_s).pow(2).mean()
         loss.backward()
         with torch.no_grad():
-            x_adv = (x_adv - lr * x_adv.grad).detach().requires_grad_(True)
-    return x_adv.detach()
+            grad = x.grad
+            # Gradient step on free bytes only
+            x_step = x - step_size * grad * free_t
+            # Π_C in-loop: L∞ ball around originals ∩ [0, 255]; non-free frozen
+            delta = (x_step - x0).clamp(-float(eps), float(eps))
+            x_proj = torch.where(
+                free_t.bool(),
+                (x0 + delta).clamp(0.0, 255.0),
+                x0,
+            )
+            x = x_proj.detach().requires_grad_(True)
+
+    # Quantize free bytes; re-verify happens in caller via original extractor
+    final = x.detach().numpy()
+    for i in range(len(w)):
+        for b in range(8):
+            if free[i, b]:
+                w.at[i, f"b{b}"] = int(np.clip(int(round(final[i, b])), 0, 255))
+    for b in range(8):
+        w[f"b{b}"] = w[f"b{b}"].astype(int).clip(0, 255)
+    return w, PATH_TRUE_PGD
 
 
 def pgd_evade(
@@ -482,124 +619,63 @@ def pgd_evade(
     normal_df: pd.DataFrame,
     family: str,
     seed: int = 0,
-    steps: int = 150,
-    lr: float = 1.0,
+    steps: int = 100,
+    lr: float = 4.0,
+    eps: float = 48.0,
 ) -> EvasionResult:
-    """PGD on features after stream thinning; byte targets applied; re-extract.
+    """Frame-space PGD on free attack-frame bytes; two-pass re-extract verify.
 
     Path labels (per window):
-      - true_pgd: gradient + two-pass refine was used (only these count as PGD)
-      - thin: rate-thinning / blend only (PGD refine did not beat thin)
-      - naive_fallback: no usable evasive morph; raw naive window kept
-    Actual recon MSE is reported even when worse than naive (no clamp).
+      - true_pgd: frame-space PGD ran (Π_C in-loop on bytes); these count as PGD
+      - naive_fallback: no free bytes to optimize; raw naive window kept
+    Thinning is **not** part of this path (mimicry-only). Actual recon MSE is
+    reported even when worse than naive (no clamp).
     """
-    rng = np.random.default_rng(seed)
-    nb = estimate_normal_byte_means(normal_df)
+    del normal_df, seed  # byte targets unused; signature kept for call-site stability
     model.eval()
 
-    n_err, n_feat, _, _ = _window_errors(model, scaler, attack_df, family)
-
-    # Aggressive thin first (mimicry base), then PGD-polish free bytes on stream
-    thinned = thin_attack_stream(
-        attack_df, family, rng,
-        keep_frac=0.3, spoof_blend=0.25, byte_strength=0.8,
-        normal_byte_means=nb,
+    n_errs, e_errs, n_feats, e_feats, retained, viols, paths = (
+        [], [], [], [], [], [], [],
     )
 
-    labels = thinned["label"].to_numpy()
-    e_errs, e_feats, retained, viols, paths = [], [], [], [], []
-    n_paired, n_feats_paired = [], []
-
-    naive_windows = []
+    labels = attack_df["label"].to_numpy()
     for s, e in window_indices(len(attack_df)):
-        if float((attack_df["label"].iloc[s:e] == "attack").mean()) < 0.02:
-            continue
-        naive_windows.append(attack_df.iloc[s:e].reset_index(drop=True))
-        if len(naive_windows) >= 40:
-            break
-
-    wi = 0
-    for s, e in window_indices(len(thinned)):
         if float((labels[s:e] == "attack").mean()) < 0.02:
             continue
-        if wi >= len(naive_windows):
-            break
-        w = thinned.iloc[s:e].copy().reset_index(drop=True)
-        ts, ids, data = frames_from_df(w)
-        feat_m = project_features(extract_window_features(ts, ids, data))
-
-        x_s = scaler.transform(feat_m[None, :]).astype(np.float32)
-        x_adv_s = pgd_feature_step(model, torch.from_numpy(x_s), steps=steps, lr=lr)
-        std = np.where(scaler.std < 1e-8, 1.0, scaler.std)
-        x_adv = project_features(x_adv_s.numpy()[0] * std + scaler.mean)
-
-        # Apply PGD byte_mean targets to free bytes
-        byte_mean_adv = x_adv[3 * K + 1 : 4 * K + 1]
-        id_list = list(ALL_IDS)
-        for i, row in w.iterrows():
-            cid = int(row["can_id"])
-            if cid not in id_list:
-                continue
-            if family == "injection" and cid == INJECT_ID:
-                start_b = 2
-            elif family in ("spoof", "replay") and cid == 0x100:
-                start_b = 2
-            else:
-                start_b = 0
-            if family == "replay" and cid == 0x100:
-                continue
-            target = float(byte_mean_adv[id_list.index(cid)])
-            for b in range(start_b, 8):
-                cur = float(w.at[i, f"b{b}"])
-                w.at[i, f"b{b}"] = int(np.clip(round(0.3 * cur + 0.7 * target), 0, 255))
-
-        ts2, ids2, data2 = frames_from_df(w)
-        feat_pgd = project_features(extract_window_features(ts2, ids2, data2))
-        err_pgd = float(reconstruction_errors(model, scaler.transform(feat_pgd[None, :]))[0])
-        err_thin = float(reconstruction_errors(model, scaler.transform(feat_m[None, :]))[0])
-
-        # paired naive (report actual errors — no never-worse clamp)
-        nw = naive_windows[wi]
+        nw = attack_df.iloc[s:e].reset_index(drop=True)
         ts_n, ids_n, data_n = frames_from_df(nw)
         feat_n = project_features(extract_window_features(ts_n, ids_n, data_n))
         err_n = float(reconstruction_errors(model, scaler.transform(feat_n[None, :]))[0])
 
-        # Prefer true PGD when it beats thin; otherwise keep thin (labeled honestly).
-        # Do NOT clamp to naive — report actual recon MSE.
-        if err_pgd < err_thin - 1e-12:
-            feat_r, err_r, w_best = feat_pgd, err_pgd, w
-            path = PATH_TRUE_PGD
-        else:
-            feat_r, err_r = feat_m, err_thin
-            w_best = thinned.iloc[s:e].reset_index(drop=True)
-            path = PATH_THIN
+        w_adv, path = pgd_frame_bytes(
+            model, scaler, nw, family, steps=steps, step_size=lr, eps=eps,
+        )
+        ts_a, ids_a, data_a = frames_from_df(w_adv)
+        feat_a = project_features(extract_window_features(ts_a, ids_a, data_a))
+        err_a = float(reconstruction_errors(model, scaler.transform(feat_a[None, :]))[0])
 
-        n_paired.append(err_n)
-        n_feats_paired.append(feat_n)
-        e_errs.append(err_r)
-        e_feats.append(feat_r)
-        retained.append(1.0 if objective_retained(w_best, family) else 0.0)
-        viols.append(1.0 if constraint_violations(feat_r) > 0 else 0.0)
+        n_errs.append(err_n)
+        n_feats.append(feat_n)
+        e_errs.append(err_a)
+        e_feats.append(feat_a)
+        retained.append(1.0 if objective_retained(w_adv, family) else 0.0)
+        viols.append(1.0 if constraint_violations(feat_a) > 0 else 0.0)
         paths.append(path)
-        wi += 1
-        if wi >= 40:
+        if len(e_errs) >= 40:
             break
 
     if not e_errs:
-        # No windows: fall back to thin-only scores, labeled as thin (not PGD).
-        e_err, e_feat, ret, _ = _window_errors(model, scaler, thinned, family)
-        m = min(len(n_err), len(e_err))
-        path_labels = np.full(m, PATH_THIN, dtype=object)
+        n_err, n_feat, ret, _ = _window_errors(model, scaler, attack_df, family)
+        path_labels = np.full(len(n_err), PATH_NAIVE_FALLBACK, dtype=object)
         return _pack(
-            "pgd", family, n_err[:m], e_err[:m], n_feat[:m], e_feat[:m],
-            ret[:m], [constraint_violations(e_feat[i]) > 0 for i in range(m)],
-            path_labels=path_labels,
+            "pgd", family, n_err, n_err, n_feat, n_feat, ret,
+            [0] * len(n_err), path_labels=path_labels,
         )
 
     return _pack(
         "pgd", family,
-        np.asarray(n_paired), np.asarray(e_errs),
-        np.stack(n_feats_paired), np.stack(e_feats),
+        np.asarray(n_errs), np.asarray(e_errs),
+        np.stack(n_feats), np.stack(e_feats),
         retained, viols,
         path_labels=np.asarray(paths, dtype=object),
     )
