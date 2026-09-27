@@ -114,16 +114,41 @@ def objective_retained(
     return True
 
 
-def estimate_normal_byte_means(normal_df: pd.DataFrame) -> dict[int, float]:
-    means: dict[int, float] = {}
+def estimate_normal_byte_means(normal_df: pd.DataFrame) -> dict[int, np.ndarray]:
+    """Per-ID, per-byte-position means (shape (8,)).
+
+    One scalar across all 8 bytes flattens counters / constants / phys encodings;
+    thinning and blending must preserve per-position structure.
+    """
+    means: dict[int, np.ndarray] = {}
+    cols = [f"b{i}" for i in range(8)]
     for cid in ALL_IDS:
         rows = normal_df[normal_df["can_id"] == cid]
         if len(rows) == 0:
-            means[cid] = 0.0
+            means[cid] = np.zeros(8, dtype=np.float64)
             continue
-        payload = rows[[f"b{i}" for i in range(8)]].to_numpy(dtype=np.float64)
-        means[cid] = float(payload.mean())
+        payload = rows[cols].to_numpy(dtype=np.float64)
+        means[cid] = payload.mean(axis=0).astype(np.float64)
     return means
+
+
+def _byte_target_vec(
+    normal_byte_means: dict,
+    cid: int,
+    default: float = 0.0,
+) -> np.ndarray:
+    """Return length-8 float target vector for ``cid``."""
+    raw = normal_byte_means.get(cid)
+    if raw is None:
+        return np.full(8, default, dtype=np.float64)
+    arr = np.asarray(raw, dtype=np.float64).reshape(-1)
+    if arr.size == 1:
+        # Back-compat: scalar-per-ID → broadcast (should not occur after rebuild)
+        return np.full(8, float(arr[0]), dtype=np.float64)
+    out = np.zeros(8, dtype=np.float64)
+    n = min(8, arr.size)
+    out[:n] = arr[:n]
+    return out
 
 
 def thin_attack_stream(
@@ -137,7 +162,7 @@ def thin_attack_stream(
     spoof_blend: float = 0.3,
     spoof_target: float = 115.0,
     byte_strength: float = 1.0,
-    normal_byte_means: Optional[dict[int, float]] = None,
+    normal_byte_means: Optional[dict[int, np.ndarray]] = None,
 ) -> pd.DataFrame:
     """Return a bus-feasible stream with attack intensity reduced toward the floor.
 
@@ -145,6 +170,8 @@ def thin_attack_stream(
     - spoof: blend phys toward baseline within objective tolerance
     - drop: unchanged structure (objective forbids re-adding); byte soften only
     - replay: keep replay payloads; soften other free bytes
+
+    Byte blending uses per-ID, per-position NORMAL means (not one scalar per ID).
     """
     family = family.lower()
     df = attack_df.copy().reset_index(drop=True)
@@ -161,14 +188,16 @@ def thin_attack_stream(
             keep = set(int(x) for x in rng.choice(idx, size=n_keep, replace=False))
             drop = [i for i in idx if i not in keep]
             df = df.drop(index=drop).reset_index(drop=True)
-        # soften free bytes on remaining injects
+        # soften free bytes on remaining injects (per-position; inject ID absent from NORMAL)
+        inj_target = _byte_target_vec(normal_byte_means, INJECT_ID, default=8.0)
         for i in df.index:
             if df.at[i, "attack_family"] != "injection":
                 continue
             for b in range(2, 8):
-                target = normal_byte_means.get(INJECT_ID, 8.0)
                 cur = float(df.at[i, f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+                df.at[i, f"b{b}"] = int(
+                    np.clip(round(cur + byte_strength * (inj_target[b] - cur)), 0, 255)
+                )
 
     elif family == "flood":
         mask = df["attack_family"].to_numpy() == "flood"
@@ -181,14 +210,16 @@ def thin_attack_stream(
             keep = set(int(x) for x in rng.choice(idx, size=n_keep, replace=False))
             drop = [i for i in idx if i not in keep]
             df = df.drop(index=drop).reset_index(drop=True)
+        flood_target = _byte_target_vec(normal_byte_means, 0x100, default=0.0)
         for i in df.index:
             if df.at[i, "attack_family"] != "flood":
                 continue
-            # pull flood payloads toward normal 0x100 bytes
-            target = normal_byte_means.get(0x100, 0.0)
+            # pull flood payloads toward normal 0x100 per-position bytes
             for b in range(8):
                 cur = float(df.at[i, f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+                df.at[i, f"b{b}"] = int(
+                    np.clip(round(cur + byte_strength * (flood_target[b] - cur)), 0, 255)
+                )
 
     elif family == "spoof":
         spec = ID_TO_SPEC[0x100]
@@ -196,33 +227,39 @@ def thin_attack_stream(
         value = spoof_target + spoof_blend * (baseline - spoof_target)
         value = float(np.clip(value, spoof_target - 25.0, spoof_target + 25.0))
         hi, lo = _encode_phys(value, spec.phys_lo, spec.phys_hi)
+        spoof_target_bytes = _byte_target_vec(normal_byte_means, 0x100, default=0.0)
         for i in df.index:
             if df.at[i, "attack_family"] != "spoof":
                 continue
             df.at[i, "b0"] = hi
             df.at[i, "b1"] = lo
             for b in range(2, 8):
-                target = normal_byte_means.get(0x100, 0.0)
                 cur = float(df.at[i, f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+                df.at[i, f"b{b}"] = int(
+                    np.clip(round(cur + byte_strength * (spoof_target_bytes[b] - cur)), 0, 255)
+                )
 
     elif family == "drop":
         for i in df.index:
             cid = int(df.at[i, "can_id"])
-            target = normal_byte_means.get(cid, 0.0)
+            target = _byte_target_vec(normal_byte_means, cid, default=0.0)
             for b in range(8):
                 cur = float(df.at[i, f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+                df.at[i, f"b{b}"] = int(
+                    np.clip(round(cur + byte_strength * (target[b] - cur)), 0, 255)
+                )
 
     elif family == "replay":
         for i in df.index:
             cid = int(df.at[i, "can_id"])
             if cid == 0x100 and df.at[i, "attack_family"] == "replay":
                 continue
-            target = normal_byte_means.get(cid, 0.0)
+            target = _byte_target_vec(normal_byte_means, cid, default=0.0)
             for b in range(2, 8):
                 cur = float(df.at[i, f"b{b}"])
-                df.at[i, f"b{b}"] = int(np.clip(round(cur + byte_strength * (target - cur)), 0, 255))
+                df.at[i, f"b{b}"] = int(
+                    np.clip(round(cur + byte_strength * (target[b] - cur)), 0, 255)
+                )
 
     for b in range(8):
         df[f"b{b}"] = df[f"b{b}"].astype(int).clip(0, 255)
