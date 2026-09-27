@@ -11,5 +11,13 @@ data/*
 results/*
 !results/.gitkeep
 !results/report.md
+!results/aggregate.json
 *.pt
 *.pth
+
+# Zen / publication audit scratch (do not commit)
+publication-security-audit.txt
+publication-tracked-files.txt
+zen_precommit.changeset
+aggregate.json.for-zen-audit.json
+*.for-zen-audit.json
