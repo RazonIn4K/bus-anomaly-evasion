@@ -8,11 +8,14 @@ from src.attack import (
     PATH_NAIVE_FALLBACK,
     PATH_THIN,
     PATH_TRUE_PGD,
+    _free_byte_mask,
+    assemble_torch_features,
     constraint_violations,
     estimate_normal_byte_means,
     mimicry_evade,
     objective_retained,
     pgd_evade,
+    pgd_frame_bytes,
     project_features,
     thin_attack_stream,
     torch_byte_mean_std,
@@ -148,3 +151,63 @@ def test_mimicry_select_score_seed_split(tmp_path):
     )
     assert len(mim.evasive_errors) > 0
     assert mim.constraint_violation_rate < 0.05
+
+
+def test_free_byte_mask_preserves_objective_bytes():
+    """Spoof phys b0/b1 and replay payloads must never be marked free."""
+    spoof = generate_attack("spoof", duration_s=5.0, seed=1, target_phys=115.0)
+    for s, e in window_indices(len(spoof)):
+        w = spoof.iloc[s:e].reset_index(drop=True)
+        if (w["attack_family"] == "spoof").sum() == 0:
+            continue
+        mask = _free_byte_mask(w, "spoof")
+        for i, row in w.iterrows():
+            if row["attack_family"] == "spoof" and int(row["can_id"]) == 0x100:
+                assert not mask[i, 0] and not mask[i, 1]
+        break
+
+    replay = generate_attack("replay", duration_s=5.0, seed=2)
+    for s, e in window_indices(len(replay)):
+        w = replay.iloc[s:e].reset_index(drop=True)
+        if (w["attack_family"] == "replay").sum() == 0:
+            continue
+        mask = _free_byte_mask(w, "replay")
+        for i, row in w.iterrows():
+            if row["attack_family"] == "replay" and int(row["can_id"]) == 0x100:
+                assert not mask[i].any()
+        break
+
+
+def test_torch_byte_features_identity_matches_numpy():
+    """Zero-step / identity payloads: torch byte mean/std match numpy extractor."""
+    atk = generate_attack("flood", duration_s=4.0, seed=0, flood_rate_hz=200.0)
+    w = atk.iloc[:50].reset_index(drop=True)
+    ts, ids, data = frames_from_df(w)
+    feat = extract_window_features(ts, ids, data)
+    pay = torch.from_numpy(data.astype(np.float32))
+    assembled = assemble_torch_features(feat, pay, ids).detach().numpy()
+    assert np.allclose(assembled, feat, atol=1e-5)
+    bm, bs = torch_byte_mean_std(pay, ids)
+    k = 15
+    b0 = 3 * k + 1
+    assert np.allclose(bm.numpy(), feat[b0 : b0 + k], atol=1e-5)
+    assert np.allclose(bs.numpy(), feat[b0 + k : b0 + 2 * k], atol=1e-5)
+
+
+def test_pgd_zero_steps_preserves_bytes(tmp_path):
+    """steps=0 / identity path must not alter objective-critical bytes after re-extract."""
+    result = run_training_pipeline(seed=0, duration_s=20.0, out_dir=tmp_path, epochs=12)
+    model, scaler = result["model"], result["scaler"]
+    atk = generate_attack("spoof", duration_s=5.0, seed=4, target_phys=115.0)
+    for s, e in window_indices(len(atk)):
+        w = atk.iloc[s:e].reset_index(drop=True)
+        if (w["attack_family"] == "spoof").sum() == 0:
+            continue
+        before = w.copy()
+        w2, path = pgd_frame_bytes(model, scaler, w, "spoof", steps=0, step_size=4.0, eps=48.0)
+        # objective bytes unchanged
+        spoof_rows = before["attack_family"] == "spoof"
+        assert (w2.loc[spoof_rows, "b0"].to_numpy() == before.loc[spoof_rows, "b0"].to_numpy()).all()
+        assert (w2.loc[spoof_rows, "b1"].to_numpy() == before.loc[spoof_rows, "b1"].to_numpy()).all()
+        break
+
