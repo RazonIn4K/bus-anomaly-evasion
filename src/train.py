@@ -141,26 +141,44 @@ def run_training_pipeline(
     duration_s: float = 150.0,
     out_dir: str | Path = "results",
     epochs: int = 80,
+    val_duration_s: float = 180.0,
+    test_duration_s: float = 90.0,
 ) -> dict:
-    """End-to-end: generate NORMAL → features → train → τ=p99(val) → save."""
+    """End-to-end: generate NORMAL → features → train → τ=p99(val) → save.
+
+    τ is calibrated on a **large dedicated held-out NORMAL stream** (separate
+    generator seed), not a thin temporal mid-slice, so fresh-normal FPR is stable.
+    Early-stopping still uses a temporal slice of the train stream.
+    """
     set_all_seeds(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df = generate_normal(duration_s=duration_s, seed=seed)
-    batch = extract_features(df, window_n=WINDOW_N, stride=WINDOW_STRIDE)
-    assert (batch.y == 0).all(), "NORMAL stream must yield only normal windows"
-    X = batch.X
-    X_train, X_val, X_test = split_normal_windows(X, seed=seed)
+    df_train = generate_normal(duration_s=duration_s, seed=seed)
+    batch_train = extract_features(df_train, window_n=WINDOW_N, stride=WINDOW_STRIDE)
+    assert (batch_train.y == 0).all(), "NORMAL stream must yield only normal windows"
+    X_all = batch_train.X
+    # Temporal slice of train stream for early-stopping only (no τ here)
+    X_train, X_earlystop, _ = split_normal_windows(X_all, seed=seed, val_frac=0.15)
+
+    # Large dedicated held-out NORMAL for τ = p99 (never attack; never train frames)
+    df_val = generate_normal(duration_s=val_duration_s, seed=seed + 901)
+    X_val = extract_features(df_val, window_n=WINDOW_N, stride=WINDOW_STRIDE).X
+    assert len(X_val) > 0
+
+    # Disjoint fresh NORMAL for same-protocol FPR check
+    df_test = generate_normal(duration_s=test_duration_s, seed=seed + 902)
+    X_test = extract_features(df_test, window_n=WINDOW_N, stride=WINDOW_STRIDE).X
 
     scaler = FeatureScaler.fit(X_train)
     X_train_s = scaler.transform(X_train)
+    X_early_s = scaler.transform(X_earlystop)
     X_val_s = scaler.transform(X_val)
     X_test_s = scaler.transform(X_test)
 
     model = build_model(input_dim=FEATURE_DIM, seed=seed)
     history = train_autoencoder(
-        model, X_train_s, X_val_s, epochs=epochs, seed=seed,
+        model, X_train_s, X_early_s, epochs=epochs, seed=seed,
     )
 
     val_err = reconstruction_errors(model, X_val_s)
@@ -182,16 +200,18 @@ def run_training_pipeline(
         "seed": seed,
         "tau": tau,
         "percentile": 99.0,
-        "tau_calibration_split": "temporal_held_out_NORMAL_val",
+        "tau_calibration_split": "dedicated_held_out_NORMAL_val_stream",
         "fpr_split_description": (
-            "same-stream temporal test split of the NORMAL generator stream "
-            "(train/val/test contiguous); τ = p99(val)"
+            "FPR on a disjoint dedicated NORMAL test stream "
+            "(seed+902); τ = p99 of dedicated NORMAL val stream (seed+901)"
         ),
         "fpr_test_normal": fpr_test,
         "n_train": int(len(X_train)),
         "n_val": int(len(X_val)),
         "n_test": int(len(X_test)),
-        "val_frac": 0.20,
+        "n_earlystop": int(len(X_earlystop)),
+        "val_duration_s": float(val_duration_s),
+        "test_duration_s": float(test_duration_s),
         "normal_duration_s": float(duration_s),
         "feature_dim": FEATURE_DIM,
         "scaler": scaler.to_dict(),

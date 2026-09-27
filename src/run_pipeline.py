@@ -40,13 +40,15 @@ def _json_safe(obj):
 
 
 
-def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: int = 50) -> dict:
+def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: int = 50,
+                 val_duration_s: float = 180.0) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     train = run_training_pipeline(
         seed=seed,
         duration_s=duration_normal,
         out_dir=out_dir,
         epochs=epochs,
+        val_duration_s=val_duration_s,
     )
     model, scaler, tau = train["model"], train["scaler"], train["tau"]
 
@@ -54,7 +56,7 @@ def run_seed(seed: int, out_dir: Path, duration_normal: float = 150.0, epochs: i
         model, scaler, tau, seed=seed, duration_s=10.0, normal_duration_s=10.0,
     )
     # Large fresh NORMAL stream for FPR stability + matched 1% FPR threshold (ROC)
-    normal_check = generate_normal(duration_s=60.0, seed=seed + 777)
+    normal_check = generate_normal(duration_s=120.0, seed=seed + 777)
     fpr_stream = evaluate_stream(model, scaler, tau, normal_check)
     fresh_err, fresh_y, _ = scores_for_frames(model, scaler, normal_check)
     # Use NORMAL windows only (y==0); pure normal stream is all zeros
@@ -209,7 +211,7 @@ def write_report(agg: dict, summaries: list[dict], path: Path) -> None:
         "",
         f"- Seeds: `{agg['seeds']}`",
         f"- Threshold rule: τ = p99 MSE on held-out NORMAL validation (never attack/test).",
-        f"- τ calibration split: **`{cal}`** (temporal early/mid/late contiguous windows).",
+        f"- τ calibration split: **`{cal}`** (dedicated held-out NORMAL val stream).",
         f"- Mean val windows / seed: **{_fmt(agg.get('n_val_windows_mean'), 1)}**",
         f"- Same-stream split FPR (mean±std): "
         f"**{_fmt(agg['fpr_same_stream_split_mean'])} ± {_fmt(agg['fpr_same_stream_split_std'])}**",
