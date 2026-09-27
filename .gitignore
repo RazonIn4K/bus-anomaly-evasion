@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+# keep the dirs, ignore their contents
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+*.pt
+*.pth
